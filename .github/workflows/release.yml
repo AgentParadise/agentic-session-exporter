@@ -53,8 +53,10 @@ jobs:
           - platform: darwin-arm64
             runs-on: macos-14
             target: aarch64-apple-darwin
+          # See ci.yml: macos-13 is retiring and starves. Cross-compiled from
+          # Apple Silicon, which the Apple toolchain supports natively.
           - platform: darwin-amd64
-            runs-on: macos-13
+            runs-on: macos-14
             target: x86_64-apple-darwin
           - platform: windows-amd64
             runs-on: windows-latest
@@ -98,7 +100,7 @@ jobs:
       # that built it. Cross-built targets cannot run here and are skipped
       # explicitly rather than silently.
       - name: Verify the built binary answers --version
-        if: matrix.platform != 'linux-arm64'
+        if: matrix.platform != 'linux-arm64' && matrix.platform != 'darwin-amd64'
         shell: bash
         run: |
           set -euo pipefail
