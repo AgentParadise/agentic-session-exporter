@@ -1,0 +1,59 @@
+[package]
+name = "agentic-session-exporter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.88"
+description = "Reference client for the APS-V1-0004 session-capture Exporter profile: reads local agent transcripts and uploads SCS envelopes (raw verbatim) to any conformant store."
+repository = "https://github.com/AgentParadise/agentic-session-exporter"
+keywords = ["sessions", "transcripts", "agents", "observability"]
+categories = ["command-line-utilities"]
+
+# Two names per binary, built from the same source.
+#
+# `apss-*` are the primaries: this crate is the reference client OF A STANDARD,
+# not of one store, so its executables are named for the standard rather than
+# for any vendor or for this repository. `env!("CARGO_BIN_NAME")` differs per
+# target, so each alias self-reports its own name in --version and --help.
+#
+# The `SeshMagic*` aliases are compatibility only, for deployments that already
+# hardcode them. They are scheduled for removal in a declared major release,
+# not silently: an operator whose capture stops with no message is worse off
+# than one told to rename a file.
+[[bin]]
+name = "apss-session-exporter"
+path = "src/bin/exporter.rs"
+
+[[bin]]
+name = "SeshMagicSessionExporter"
+path = "src/bin/exporter.rs"
+
+[[bin]]
+name = "apss-session-reconstitute"
+path = "src/bin/reconstitute.rs"
+
+[[bin]]
+name = "SeshMagicSessionReconstitute"
+path = "src/bin/reconstitute.rs"
+
+# Versions were inlined from the source workspace's [workspace.dependencies].
+# This crate is now standalone, so there is no workspace to inherit from.
+[dependencies]
+# PINNED TO 1.0.0 DELIBERATELY. The standard is at 2.0.0 (origin.deployment,
+# #[non_exhaustive] Origin, constructors) but 2.0.0 is merged to the standards
+# repo and NOT PUBLISHED to crates.io - only 1.0.0 resolves. Bump this the day
+# 2.0.0 publishes; until then this crate cannot stamp origin.deployment.
+apss-v1-0004-session-capture = "1.0.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-std", "io-util", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
