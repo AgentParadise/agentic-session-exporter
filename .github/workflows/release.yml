@@ -131,14 +131,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Two spellings, both fully static: x86_64 musl emits a
+          # position-independent "static-pie linked", aarch64 emits
+          # "statically linked". Matching an allowlist rather than negating
+          # "dynamically linked" keeps this failing closed if `file` ever
+          # words a third variant differently.
           for b in $BINARIES; do
             f="./dist/${b}-${{ matrix.platform }}"
-            if ! file "$f" | grep -q 'statically linked'; then
-              echo "::error::$f is not statically linked:"
-              file "$f"
-              exit 1
-            fi
-            echo "ok: $f"
+            desc=$(file -b "$f")
+            case "$desc" in
+              *"statically linked"*|*"static-pie linked"*)
+                echo "ok: $f - $desc" ;;
+              *)
+                echo "::error::$f is not statically linked: $desc"
+                exit 1 ;;
+            esac
           done
 
       - uses: actions/upload-artifact@v4
