@@ -29,13 +29,13 @@ implementation whatsoever. Point it at whichever store you run.
 
 ## The standard this implements
 
-**[APS-V1-0004 &mdash; Session Capture](https://github.com/AgentParadise/agent-paradise-standards-system/tree/main/standards/v1/APS-V1-0004-session-capture)**
+**[APS-V1-0004 - Session Capture](https://github.com/AgentParadise/agent-paradise-standards-system/tree/main/standards/v1/APS-V1-0004-session-capture)**
 
 That identifier is opaque until you have seen one, so briefly: APS-V1-0004 is a
 public specification from the [Agent Paradise Standards
 System](https://github.com/AgentParadise/agent-paradise-standards-system). It
-answers one question &mdash; *what does a captured agent session look like, so
-that any tool can write one and any store can read it* &mdash; and it answers it
+answers one question - *what does a captured agent session look like, so
+that any tool can write one and any store can read it* - and it answers it
 without requiring anyone to agree on a provider's internal transcript format.
 
 The core idea is a thin **envelope**: a small set of fields a store can sort,
@@ -54,7 +54,7 @@ It defines three conformance profiles:
 
 **This repository is the reference implementation of the Exporter profile** (and
 of Source, since it has to read transcripts to export them). A store implements
-the receive side. Neither depends on the other &mdash; both depend on the
+the receive side. Neither depends on the other - both depend on the
 standard, which is the entire point: you can swap either half without the other
 noticing.
 
@@ -100,7 +100,7 @@ apss-session-reconstitute <session-id>
 | Codex | `codex-turns-v1` | `~/.codex/sessions` | `CODEX_SESSIONS_ROOT` |
 | Cursor | SQLite state db | Cursor's state database | `CURSOR_STATE_DB` |
 
-Adding one is meant to be a small, contained change — one module, registered.
+Adding one is meant to be a small, contained change - one module, registered.
 See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) section 6 for the shape a
 harness has to take, and why the rest of the pipeline must not need editing.
 
@@ -121,7 +121,7 @@ list is a product decision rather than a build detail.
 
 ## Install
 
-**From a release** — download the binary for your platform, then verify before
+**From a release** - download the binary for your platform, then verify before
 trusting it:
 
 ```bash
@@ -133,7 +133,7 @@ cosign verify-blob --signature SHA256SUMS.sig \
 sha256sum --check SHA256SUMS --ignore-missing
 ```
 
-**Into a container image** — copy from the published OCI image by digest, never
+**Into a container image** - copy from the published OCI image by digest, never
 by tag:
 
 ```dockerfile
@@ -157,7 +157,7 @@ pre-rename names. They are scheduled for removal in a declared major release,
 never silently: an operator whose capture stops with no message is worse off
 than one told to rename a file.
 
-The `apss-` prefix is deliberate — this is the reference client of a standard, so
+The `apss-` prefix is deliberate - this is the reference client of a standard, so
 its executables are named for the standard rather than for a vendor or for this
 repository.
 
@@ -173,7 +173,7 @@ repository.
 ## Security
 
 Artifacts are signed with cosign keyless OIDC. The write token is never printed
-to stdout, stderr, or a log line — [there is a test for it](tests/cli.rs),
+to stdout, stderr, or a log line - [there is a test for it](tests/cli.rs),
 because this binary's output is routinely captured into durable logs by whatever
 invokes it.
 
@@ -181,4 +181,4 @@ Report vulnerabilities privately via GitHub Security Advisories.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).

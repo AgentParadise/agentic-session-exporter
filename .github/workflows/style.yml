@@ -1,0 +1,37 @@
+name: Style
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no-dashes:
+    name: No em or en dashes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # A house rule that is only written down is a house rule that erodes. This
+      # is trivially cheap to check, so it is checked rather than remembered.
+      - name: Reject em dashes, en dashes, and their HTML entities
+        run: |
+          set -euo pipefail
+          # The patterns are built from codepoints rather than written
+          # literally, or this file would fail its own check. It also excludes
+          # itself by name, so the two guards are belt and braces.
+          EM=$(printf '\u2014')
+          EN=$(printf '\u2013')
+          if hits=$(grep -rIn -e "$EM" -e "$EN" -e '&mdash;' -e '&ndash;' \
+                      --exclude-dir=.git --exclude-dir=target \
+                      --exclude=style.yml . 2>/dev/null); then
+            echo "::error::em/en dashes are not permitted anywhere in this repo."
+            echo "::error::Use a plain hyphen, a comma, or a new sentence. See AGENTS.md."
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no em or en dashes"

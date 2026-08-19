@@ -9,7 +9,7 @@ can query. Should take about five minutes.
 apss-session-exporter --version
 ```
 
-Answers with no configuration at all — no store URL, no token, no network. If
+Answers with no configuration at all - no store URL, no token, no network. If
 this needs configuration to succeed, something is wrong: `--version` is what a
 supervisor calls to prove the binary is present, and it must never do work.
 
@@ -20,7 +20,7 @@ export SESSION_STORE_URL="https://sessions.example.com"
 export SESSIONS_WRITE_TOKEN="…"
 ```
 
-The URL must be an **origin only** — `scheme://host[:port]`, no path, no query,
+The URL must be an **origin only** - `scheme://host[:port]`, no path, no query,
 no credentials in userinfo. A credential in a URL ends up in logs.
 
 Omit the token only if the store genuinely accepts unauthenticated writes.
@@ -37,7 +37,7 @@ apss-session-exporter --dry-run
 ```
 
 Reports what it found and what it would send, without sending. Run this first on
-a machine with a long history — it is also how you discover a harness whose
+a machine with a long history - it is also how you discover a harness whose
 transcripts live somewhere non-default.
 
 Nothing found? See [troubleshooting](troubleshooting.md).
@@ -73,7 +73,7 @@ or not being found. Fix that before scheduling anything.
 apss-session-exporter --loop
 ```
 
-Or drive it from cron, a systemd timer, or a launchd agent — the binary does not
+Or drive it from cron, a systemd timer, or a launchd agent - the binary does not
 care, and a one-shot invocation is always safe to repeat.
 
 ## What "done" looks like

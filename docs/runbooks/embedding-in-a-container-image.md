@@ -13,7 +13,7 @@ COPY --from=ghcr.io/agentparadise/agentic-session-exporter@sha256:<digest> \
 Three deliberate choices:
 
 **An OCI image, not a release asset.** `COPY --from=` cannot consume a GitHub
-release. The alternative — `curl` at build time — puts an unverified binary in
+release. The alternative - `curl` at build time - puts an unverified binary in
 your image and makes the build depend on a download.
 
 **By digest, never by tag.** A tag is mutable. Pinning one means an upstream push
