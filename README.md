@@ -3,13 +3,17 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/AgentParadise/agentic-session-exporter/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/AgentParadise/agentic-session-exporter/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://github.com/AgentParadise/agentic-session-exporter/actions/workflows/release.yml"><img alt="Release" src="https://github.com/AgentParadise/agentic-session-exporter/actions/workflows/release.yml/badge.svg"></a>
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <img alt="Rust" src="https://img.shields.io/badge/rust-1.88%2B-orange.svg">
-  <img alt="Platforms" src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS%20%7C%20windows-lightgrey.svg">
-  <img alt="Signed" src="https://img.shields.io/badge/artifacts-cosign%20signed-green.svg">
-  <img alt="Standard" src="https://img.shields.io/badge/APS--V1--0004-Exporter%20profile-7c5cff.svg">
+  <a href="https://github.com/AgentParadise/agentic-session-exporter/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/AgentParadise/agentic-session-exporter/ci.yml?branch=main&label=CI&style=for-the-badge&labelColor=0d1117&color=2dd4a7"></a>
+  <a href="https://github.com/AgentParadise/agentic-session-exporter/actions/workflows/release.yml"><img alt="Release" src="https://img.shields.io/github/actions/workflow/status/AgentParadise/agentic-session-exporter/release.yml?label=release&style=for-the-badge&labelColor=0d1117&color=2dd4a7"></a>
+  <a href="https://github.com/AgentParadise/agentic-session-exporter/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/AgentParadise/agentic-session-exporter?style=for-the-badge&labelColor=0d1117&color=2dd4a7"></a>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-8b9bb4?style=flat-square&labelColor=0d1117"></a>
+  <img alt="Rust 1.88+" src="https://img.shields.io/badge/rust-1.88%2B-8b9bb4?style=flat-square&labelColor=0d1117">
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-linux%20%C2%B7%20macos%20%C2%B7%20windows-8b9bb4?style=flat-square&labelColor=0d1117">
+  <img alt="Harnesses" src="https://img.shields.io/badge/harnesses-claude%20%C2%B7%20codex%20%C2%B7%20cursor-8b9bb4?style=flat-square&labelColor=0d1117">
+  <a href="#the-standard-this-implements"><img alt="Implements APS-V1-0004" src="https://img.shields.io/badge/implements-APS--V1--0004-2dd4a7?style=flat-square&labelColor=0d1117"></a>
 </p>
 
 # agentic-session-exporter
@@ -22,6 +26,42 @@ verbatim, and uploads it to a session store you choose.
 It is a client of a **standard**, not of a product. It depends on
 `apss-v1-0004-session-capture` and third-party crates, and on no store
 implementation whatsoever. Point it at whichever store you run.
+
+## The standard this implements
+
+**[APS-V1-0004 &mdash; Session Capture](https://github.com/AgentParadise/agent-paradise-standards-system/tree/main/standards/v1/APS-V1-0004-session-capture)**
+
+That identifier is opaque until you have seen one, so briefly: APS-V1-0004 is a
+public specification from the [Agent Paradise Standards
+System](https://github.com/AgentParadise/agent-paradise-standards-system). It
+answers one question &mdash; *what does a captured agent session look like, so
+that any tool can write one and any store can read it* &mdash; and it answers it
+without requiring anyone to agree on a provider's internal transcript format.
+
+The core idea is a thin **envelope**: a small set of fields a store can sort,
+deduplicate and attribute by (who, when, where from, which agent), wrapped
+around the provider's raw transcript preserved **byte for byte**. Because the
+standard never claims to understand a provider's internals, it cannot rot when
+those internals change.
+
+It defines three conformance profiles:
+
+| Profile | Meaning |
+| --- | --- |
+| **Source** | read a provider's local transcripts into envelopes |
+| **Exporter** | push envelopes to a store's batch endpoint |
+| **Reconstitutor** | write a stored session back to disk and resume it natively |
+
+**This repository is the reference implementation of the Exporter profile** (and
+of Source, since it has to read transcripts to export them). A store implements
+the receive side. Neither depends on the other &mdash; both depend on the
+standard, which is the entire point: you can swap either half without the other
+noticing.
+
+Worth reading if you are integrating: the
+[specification](https://github.com/AgentParadise/agent-paradise-standards-system/blob/main/standards/v1/APS-V1-0004-session-capture/docs/01_spec.md)
+and the
+[envelope JSON Schema](https://github.com/AgentParadise/agent-paradise-standards-system/blob/main/standards/v1/APS-V1-0004-session-capture/schemas/session-envelope.schema.json).
 
 ## Quick start
 
