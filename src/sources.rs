@@ -245,10 +245,7 @@ mod tests {
     use std::io::Write;
 
     fn origin() -> Origin {
-        Origin {
-            host: "test-host".into(),
-            environment: "laptop".into(),
-        }
+        Origin::new("test-host", "laptop")
     }
 
     fn write(path: &Path, body: &str) {

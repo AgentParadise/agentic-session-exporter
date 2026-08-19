@@ -92,10 +92,10 @@ pub(crate) fn install_warn_logging() {
 /// Discover every source's transcripts under the configured roots. Public so the
 /// binary can print a dry-run count.
 pub fn discover_all(cfg: &Config) -> Result<Vec<Discovered>, sources::SourceError> {
-    let origin = Origin {
-        host: cfg.origin_host.clone(),
-        environment: cfg.origin_environment.clone(),
-    };
+    let mut origin = Origin::new(cfg.origin_host.clone(), cfg.origin_environment.clone());
+    if let Some(deployment) = &cfg.origin_deployment {
+        origin = origin.with_deployment(deployment.clone());
+    }
     let mut all = Vec::new();
     all.extend(sources::discover_claude(&cfg.claude_root, &origin)?);
     all.extend(sources::discover_codex(&cfg.codex_root, &origin)?);
@@ -398,10 +398,7 @@ mod tests {
     fn envelope(id: &str, filler: usize) -> SessionEnvelope {
         SessionEnvelope {
             scs_version: SCS_VERSION.to_string(),
-            origin: Origin {
-                host: "h".into(),
-                environment: "test".into(),
-            },
+            origin: Origin::new("h", "test"),
             agent: "Cursor".into(),
             source_format: "cursor-state-vscdb".into(),
             session_id: id.into(),
@@ -666,6 +663,7 @@ mod tests {
         let claude_root = tmp.join("claude");
         write_claude_transcript(&claude_root);
         Config {
+            origin_deployment: None,
             store_url: store_url.to_string(),
             write_token: Some("tok".into()),
             origin_host: "test-host".into(),

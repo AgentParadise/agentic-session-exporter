@@ -81,6 +81,7 @@ export SESSIONS_WRITE_TOKEN="..."          # omit for an unauthenticated store
 # Who is sending them. Both optional, both worth setting.
 export SESSION_STORE_ORIGIN_ENV="laptop"   # default: laptop
 export SESSION_STORE_ORIGIN_HOST="$(hostname)"
+export SESSION_STORE_ORIGIN_DEPLOYMENT=""  # optional: which deployment, e.g. myapp__prod
 
 apss-session-exporter --dry-run            # show what it would send, send nothing
 apss-session-exporter                      # sweep and upload

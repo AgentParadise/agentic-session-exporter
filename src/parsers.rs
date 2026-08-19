@@ -232,10 +232,7 @@ mod tests {
     use super::*;
 
     fn origin() -> Origin {
-        Origin {
-            host: "box".into(),
-            environment: "vps".into(),
-        }
+        Origin::new("box", "vps")
     }
 
     #[test]

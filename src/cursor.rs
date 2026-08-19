@@ -401,10 +401,7 @@ mod tests {
     use rusqlite::params;
 
     fn origin() -> Origin {
-        Origin {
-            host: "test-host".into(),
-            environment: "laptop".into(),
-        }
+        Origin::new("test-host", "laptop")
     }
 
     fn timestamp_millis(value: &str) -> i64 {
