@@ -64,11 +64,28 @@ transcript behind it is an assumption.
 
 ## Branching
 
-`main` is development. `release` publishes. A PR into `release` clears a gate
-that is stricter than CI: version bumped and untagged, lockfile in sync, all
-five platforms building in release mode, OCI image building multi-arch. Tagging
-`v*` publishes binaries, one checksum manifest, one signature over it, and the
-signed OCI image.
+`main` is development. `release` publishes.
+
+`release` is protected, and the protection is the point: a gate that a direct
+push can bypass is not a gate, it is a suggestion. Enforced on the branch:
+
+- a pull request is required, so nothing lands by push
+- **Release Gate Success** must pass, with `strict` on so the branch must be up
+  to date with its base first (a gate that passed against stale code proves
+  nothing about what actually merges)
+- force pushes and deletion are blocked, so published history cannot be rewritten
+  underneath a consumer who pinned a digest from it
+- conversation resolution is required, so a raised concern cannot be merged past
+  in silence
+
+The gate itself is deliberately stricter than CI rather than a rerun of it:
+version bumped and untagged, lockfile in sync, all five platforms building in
+release mode, OCI image building multi-arch. Tagging `v*` then publishes
+binaries, one checksum manifest, one signature over it, and the signed OCI image.
+
+Approvals are set to zero on purpose for now, since this is a single-maintainer
+repo and requiring a second approver would only teach people to bypass the
+protection. Raise it when there is a second maintainer, not before.
 
 ## Before opening a PR
 
