@@ -70,10 +70,55 @@ pub struct Config {
 /// Configuration errors surfaced at startup.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// SESSION_STORE_ORIGIN_ENV was set to something the standard does not
+    /// define. Refused rather than passed through: the field is a REQUIRED
+    /// enum, and a store filtering on the defined classes silently misses
+    /// anything else.
+    #[error("SESSION_STORE_ORIGIN_ENV must be one of local, vps, container, workflow (got {0:?})")]
+    InvalidEnvironment(String),
+
     #[error("missing required env var {0}")]
     Missing(&'static str),
     #[error("could not determine home directory (set HOME)")]
     NoHome,
+}
+
+/// Best-effort runtime CLASS when `SESSION_STORE_ORIGIN_ENV` is unset.
+///
+/// APS-V1-0004 4.2.1 requires `origin.environment` and defines it as one of
+/// `local`, `vps`, `container`, `workflow`. The previous default was `laptop`,
+/// which is not one of them: every session written without an explicit value
+/// was out of spec on a REQUIRED field, and a store filtering by the documented
+/// classes matched none of them.
+///
+/// Detects a container rather than guessing, because that is where a wrong
+/// answer costs most - a containerised run labelled `local` is indistinguishable
+/// from a developer machine in a shared corpus. Falls back to `local`, which is
+/// the honest answer for an unmarked host and is at least a value the standard
+/// defines.
+///
+/// An operator who knows better sets the variable; this only decides what
+/// happens when nobody said.
+/// The only values APS-V1-0004 4.2.1 defines for `origin.environment`.
+///
+/// Enforced rather than documented. Accepting any non-empty string is how
+/// "laptop" shipped into a required enum field and stayed there.
+pub const ENVIRONMENT_CLASSES: [&str; 4] = ["local", "vps", "container", "workflow"];
+
+fn detect_environment_class() -> String {
+    // The markers the major runtimes leave: /.dockerenv is Docker,
+    // /run/.containerenv is Podman, and the cgroup path catches the rest.
+    let containerised = std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+        || std::fs::read_to_string("/proc/1/cgroup")
+            .map(|c| c.contains("docker") || c.contains("containerd") || c.contains("kubepods"))
+            .unwrap_or(false);
+
+    if containerised {
+        "container".to_string()
+    } else {
+        "local".to_string()
+    }
 }
 
 impl Config {
@@ -98,8 +143,11 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(default_hostname);
-        let origin_environment =
-            env::var("SESSION_STORE_ORIGIN_ENV").unwrap_or_else(|_| "laptop".to_string());
+        let origin_environment = match non_empty(env::var("SESSION_STORE_ORIGIN_ENV").ok()) {
+            Some(v) if ENVIRONMENT_CLASSES.contains(&v.as_str()) => v,
+            Some(v) => return Err(ConfigError::InvalidEnvironment(v)),
+            None => detect_environment_class(),
+        };
         let origin_deployment = non_empty(env::var("SESSION_STORE_ORIGIN_DEPLOYMENT").ok());
 
         let claude_root = env::var_os("CLAUDE_PROJECTS_ROOT")
@@ -349,6 +397,9 @@ mod tests {
         "HOME",
         "SESSION_STORE_ORIGIN_HOST",
         "SESSION_STORE_ORIGIN_ENV",
+        // Must be listed, or with_env cannot clear it and a value set by one
+        // test leaks into every test after it.
+        "SESSION_STORE_ORIGIN_DEPLOYMENT",
         "CLAUDE_PROJECTS_ROOT",
         "CODEX_SESSIONS_ROOT",
         "CURSOR_STATE_DB",
@@ -433,6 +484,109 @@ mod tests {
     }
 
     #[test]
+    fn deployment_is_absent_when_unset() {
+        // Absent is a real answer: a single-deployment host genuinely has no
+        // deployment identity, and inventing one would stamp a fabricated value
+        // on every session.
+        with_env(
+            &[
+                ("SESSION_STORE_URL", "http://store.example"),
+                ("HOME", "/tmp/exporter-home-dep"),
+            ],
+            || assert!(Config::from_env().unwrap().origin_deployment.is_none()),
+        );
+    }
+
+    #[test]
+    fn deployment_is_read_and_namespaces() {
+        with_env(
+            &[
+                ("SESSION_STORE_URL", "http://store.example"),
+                ("HOME", "/tmp/exporter-home-dep"),
+                ("SESSION_STORE_ORIGIN_DEPLOYMENT", "syntropic137__prod"),
+            ],
+            || {
+                assert_eq!(
+                    Config::from_env().unwrap().origin_deployment.as_deref(),
+                    Some("syntropic137__prod")
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn an_empty_deployment_is_treated_as_absent() {
+        // "" is what an unset shell variable expands to in a container
+        // entrypoint. Storing it would be a deployment identity of nothing,
+        // which a store would group on as its own source.
+        with_env(
+            &[
+                ("SESSION_STORE_URL", "http://store.example"),
+                ("HOME", "/tmp/exporter-home-dep"),
+                ("SESSION_STORE_ORIGIN_DEPLOYMENT", ""),
+            ],
+            || assert!(Config::from_env().unwrap().origin_deployment.is_none()),
+        );
+    }
+
+    #[test]
+    fn a_value_outside_the_standard_enum_is_refused() {
+        // "laptop" was the shipped default for months and is not one of the
+        // four classes 4.2.1 defines. Accepting any non-empty string is how it
+        // survived; the field is a REQUIRED enum, so this refuses instead.
+        with_env(
+            &[
+                ("SESSION_STORE_URL", "http://store.example"),
+                ("HOME", "/tmp/exporter-home-enum"),
+                ("SESSION_STORE_ORIGIN_ENV", "laptop"),
+            ],
+            || {
+                assert!(matches!(
+                    Config::from_env(),
+                    Err(ConfigError::InvalidEnvironment(v)) if v == "laptop"
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn the_detected_environment_is_a_class_the_standard_defines() {
+        const DEFINED: [&str; 4] = ["local", "vps", "container", "workflow"];
+        let detected = detect_environment_class();
+        assert!(
+            DEFINED.contains(&detected.as_str()),
+            "detected {detected:?}, which APS-V1-0004 4.2.1 does not define"
+        );
+    }
+
+    #[test]
+    fn an_explicit_environment_wins_over_detection() {
+        with_env(
+            &[
+                ("SESSION_STORE_URL", "http://store.example"),
+                ("HOME", "/tmp/exporter-home-env"),
+                ("SESSION_STORE_ORIGIN_ENV", "vps"),
+            ],
+            || assert_eq!(Config::from_env().unwrap().origin_environment, "vps"),
+        );
+    }
+
+    #[test]
+    fn an_empty_environment_falls_back_to_detection() {
+        // An unset shell variable expands to "" in a container entrypoint.
+        // Storing it would put an empty string in a REQUIRED field, which the
+        // standard's own validator rejects.
+        with_env(
+            &[
+                ("SESSION_STORE_URL", "http://store.example"),
+                ("HOME", "/tmp/exporter-home-env"),
+                ("SESSION_STORE_ORIGIN_ENV", ""),
+            ],
+            || assert!(!Config::from_env().unwrap().origin_environment.is_empty()),
+        );
+    }
+
+    #[test]
     fn from_env_defaults_when_only_required_present() {
         with_env(
             &[
@@ -446,7 +600,9 @@ mod tests {
                 assert_eq!(cfg.store_url, "http://store:18090");
                 assert_eq!(cfg.write_token, None);
                 assert_eq!(cfg.origin_host, "host-a");
-                assert_eq!(cfg.origin_environment, "laptop");
+                // Was "laptop", which APS-V1-0004 4.2.1 does not define. Now
+                // detected, and always one of the four classes it names.
+                assert!(["local", "container"].contains(&cfg.origin_environment.as_str()));
                 assert_eq!(
                     cfg.claude_root,
                     PathBuf::from("/tmp/exporter-home-xyz/.claude/projects")
@@ -669,65 +825,6 @@ mod tests {
         assert_eq!(
             default_state_file(home, ""),
             home.join(".cache/seshmagic-session-store/exporter-state-unknown-host.json")
-        );
-    }
-}
-
-#[cfg(test)]
-mod deployment_tests {
-    use super::*;
-
-    /// `origin.deployment` is the field APS-V1-0004 2.0.0 added, and the reason
-    /// this crate needed the major bump. These pin that it reaches the config
-    /// and that absent stays absent.
-    #[test]
-    fn deployment_is_absent_when_unset() {
-        // Absent is a real answer, not a missing one: a single-deployment
-        // machine genuinely has no deployment identity, and inventing one would
-        // put a fabricated value on every laptop session.
-        temp_env::with_vars(
-            [
-                ("SESSION_STORE_URL", Some("http://store.example")),
-                ("SESSION_STORE_ORIGIN_DEPLOYMENT", None),
-            ],
-            || {
-                let cfg = Config::from_env().expect("config");
-                assert!(cfg.origin_deployment.is_none());
-            },
-        );
-    }
-
-    #[test]
-    fn deployment_is_read_and_namespaces() {
-        temp_env::with_vars(
-            [
-                ("SESSION_STORE_URL", Some("http://store.example")),
-                (
-                    "SESSION_STORE_ORIGIN_DEPLOYMENT",
-                    Some("syntropic137__prod"),
-                ),
-            ],
-            || {
-                let cfg = Config::from_env().expect("config");
-                assert_eq!(cfg.origin_deployment.as_deref(), Some("syntropic137__prod"));
-            },
-        );
-    }
-
-    #[test]
-    fn an_empty_deployment_is_treated_as_absent() {
-        // An empty string is what an unset shell variable expands to in a
-        // container entrypoint. Storing "" would be a deployment identity of
-        // nothing, which a store would group on as its own source.
-        temp_env::with_vars(
-            [
-                ("SESSION_STORE_URL", Some("http://store.example")),
-                ("SESSION_STORE_ORIGIN_DEPLOYMENT", Some("")),
-            ],
-            || {
-                let cfg = Config::from_env().expect("config");
-                assert!(cfg.origin_deployment.is_none());
-            },
         );
     }
 }

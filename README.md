@@ -79,7 +79,7 @@ export SESSION_STORE_URL="https://sessions.example.com"
 export SESSIONS_WRITE_TOKEN="..."          # omit for an unauthenticated store
 
 # Who is sending them. Both optional, both worth setting.
-export SESSION_STORE_ORIGIN_ENV="laptop"   # default: laptop
+export SESSION_STORE_ORIGIN_ENV="local"    # local | vps | container | workflow
 export SESSION_STORE_ORIGIN_HOST="$(hostname)"
 export SESSION_STORE_ORIGIN_DEPLOYMENT=""  # optional: which deployment, e.g. myapp__prod
 
@@ -98,8 +98,14 @@ content hash, so nothing uploads twice.
 multi-machine corpus readable. They cost one line each and they are the
 difference between "3,000 sessions" and "3,000 sessions I can filter".
 
-Leave them unset and every session claims to come from `laptop` on whatever
-hostname the machine happens to report. That is fine for one laptop. It stops
+`ORIGIN_ENV` must be one of the four classes APS-V1-0004 defines: `local`,
+`vps`, `container`, `workflow`. Anything else is refused at startup, because the
+field is a required enum and a store filtering on those classes silently misses
+anything outside them.
+
+Leave it unset and it is detected (`container` inside one, `local` otherwise).
+Leave `ORIGIN_HOST` unset and every session reports whatever hostname the
+machine happens to give. That is fine for one laptop. It stops
 being fine the moment a second source appears, and it is actively misleading in
 a container, where the hostname is a short-lived container id that will never be
 seen again.
@@ -108,7 +114,7 @@ Pick values and keep them stable, because a store groups on the exact string:
 
 ```bash
 # A developer machine
-export SESSION_STORE_ORIGIN_ENV="laptop"
+export SESSION_STORE_ORIGIN_ENV="local"
 
 # A long-lived box
 export SESSION_STORE_ORIGIN_ENV="vps"
@@ -116,7 +122,8 @@ export SESSION_STORE_ORIGIN_HOST="build-01"
 
 # CI or an orchestrated workspace: name the DEPLOYMENT, and set the host to
 # something that outlives the container, such as the worker node.
-export SESSION_STORE_ORIGIN_ENV="myapp__prod"
+export SESSION_STORE_ORIGIN_ENV="workflow"
+export SESSION_STORE_ORIGIN_DEPLOYMENT="myapp__prod"
 export SESSION_STORE_ORIGIN_HOST="worker-07"
 ```
 
