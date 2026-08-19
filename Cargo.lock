@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentic-session-exporter"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "apss-v1-0004-session-capture",
  "async-trait",
