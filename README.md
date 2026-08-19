@@ -18,14 +18,20 @@
 
 # agentic-session-exporter
 
-Your agent sessions are written to disk by whichever harness produced them, in
-whatever shape that harness felt like, and then they sit there. This reads them,
-wraps each one in an **SCS envelope** with the provider's bytes preserved
-verbatim, and uploads it to a session store you choose.
+Back up your agent sessions.
 
-It is a client of a **standard**, not of a product. It depends on
-`apss-v1-0004-session-capture` and third-party crates, and on no store
-implementation whatsoever. Point it at whichever store you run.
+Claude Code, Codex, and Cursor each write transcripts to your disk in their own
+format, where they stay until you lose the machine. This command reads them,
+wraps each one in a standard envelope that keeps the original bytes untouched,
+and uploads it to a session store you choose. Your sessions become searchable,
+attributable, and resumable somewhere else.
+
+It runs on a laptop, on a server, or inside a container, and it needs no daemon
+and no runtime installed.
+
+It implements a public standard rather than a product, so it depends on the
+standard and on no store at all. Point it at whichever store you run, or write
+your own receive side against the same spec.
 
 ## The standard this implements
 
@@ -68,29 +74,73 @@ and the
 Capture the sessions already on your machine:
 
 ```bash
+# Where to send them.
 export SESSION_STORE_URL="https://sessions.example.com"
-export SESSIONS_WRITE_TOKEN="…"        # omit for an unauthenticated store
+export SESSIONS_WRITE_TOKEN="..."          # omit for an unauthenticated store
 
-apss-session-exporter --dry-run        # see what it would send, upload nothing
-apss-session-exporter                  # sweep and upload
-apss-session-exporter --health         # is the store reachable?
+# Who is sending them. Both optional, both worth setting.
+export SESSION_STORE_ORIGIN_ENV="laptop"   # default: laptop
+export SESSION_STORE_ORIGIN_HOST="$(hostname)"
+
+apss-session-exporter --dry-run            # show what it would send, send nothing
+apss-session-exporter                      # sweep and upload
+apss-session-exporter --health             # can it reach the store?
 ```
 
-It discovers transcripts in each harness's default location, so there is usually
-nothing else to configure. Nothing is uploaded twice: the store deduplicates on
-`content_hash`, so re-running a sweep is always safe.
+It finds transcripts in each harness's usual location, so there is normally
+nothing else to configure. Re-running is always safe: the store deduplicates on
+content hash, so nothing uploads twice.
 
-Keep it running:
+### Say where the sessions came from
+
+`SESSION_STORE_ORIGIN_ENV` and `SESSION_STORE_ORIGIN_HOST` are what make a
+multi-machine corpus readable. They cost one line each and they are the
+difference between "3,000 sessions" and "3,000 sessions I can filter".
+
+Leave them unset and every session claims to come from `laptop` on whatever
+hostname the machine happens to report. That is fine for one laptop. It stops
+being fine the moment a second source appears, and it is actively misleading in
+a container, where the hostname is a short-lived container id that will never be
+seen again.
+
+Pick values and keep them stable, because a store groups on the exact string:
 
 ```bash
-apss-session-exporter --loop           # sweep continuously
+# A developer machine
+export SESSION_STORE_ORIGIN_ENV="laptop"
+
+# A long-lived box
+export SESSION_STORE_ORIGIN_ENV="vps"
+export SESSION_STORE_ORIGIN_HOST="build-01"
+
+# CI or an orchestrated workspace: name the DEPLOYMENT, and set the host to
+# something that outlives the container, such as the worker node.
+export SESSION_STORE_ORIGIN_ENV="myapp__prod"
+export SESSION_STORE_ORIGIN_HOST="worker-07"
 ```
 
-Bring a session back to another machine and resume it natively:
+The `<app>__<tier>` shape in that last example is a convention, not a
+requirement. A store can split on the first `__` to group by app and then by
+tier, which is what turns a flat list of machines into something you can read at
+a glance.
+
+### Keep it running
+
+```bash
+apss-session-exporter --loop
+```
+
+Or drive it from cron, a systemd timer, or a launchd agent. It holds no state
+between runs beyond its own state file, so a repeated invocation is always safe.
+
+### Bring a session back
 
 ```bash
 apss-session-reconstitute <session-id>
 ```
+
+Writes a stored session back to disk on another machine so the original harness
+can resume it.
 
 ## Supported harnesses
 

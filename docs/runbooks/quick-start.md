@@ -25,6 +25,30 @@ no credentials in userinfo. A credential in a URL ends up in logs.
 
 Omit the token only if the store genuinely accepts unauthenticated writes.
 
+## 2b. Say where the sessions came from
+
+```bash
+export SESSION_STORE_ORIGIN_ENV="laptop"       # default: laptop
+export SESSION_STORE_ORIGIN_HOST="$(hostname)" # default: the machine hostname
+```
+
+Both are optional and both are worth setting. They are what makes a
+multi-machine corpus readable later, and they cannot be fixed retroactively
+without rewriting stored rows.
+
+The defaults are only correct for a single developer laptop. In a container the
+default host is a short-lived container id that will never be seen again, so
+every run looks like a different machine and none of them are findable.
+
+| Where it runs | `ORIGIN_ENV` | `ORIGIN_HOST` |
+| --- | --- | --- |
+| developer laptop | `laptop` | hostname is fine |
+| long-lived server | `vps` | a stable name |
+| CI or orchestrated workspace | the deployment, e.g. `myapp__prod` | something that outlives the container, e.g. the worker node |
+
+Stores group on the exact string, so pick values and keep them stable. Renaming
+later splits one source into two in every view.
+
 > **Watch this one.** Many stores serve `/healthz` unauthenticated while
 > requiring auth to write. So a wrong or missing token can pass every health
 > check and fail only at upload. If `--health` passes and sweeps still fail,
