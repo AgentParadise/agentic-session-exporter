@@ -19,7 +19,7 @@ often not the one the exporter runs under.
 
 If each sweep re-uploads the same sessions, the state file is not persisting.
 Check `EXPORTER_STATE_FILE` points somewhere writable that **outlives the
-process** — a tmpfs path inside a container does not.
+process** - a tmpfs path inside a container does not.
 
 Harmless to the store, which deduplicates on `content_hash`, but it wastes the
 entire upload budget on every run.
@@ -48,7 +48,7 @@ Verify the token independently of the exporter before looking anywhere else.
 ## The store is unreachable from inside a container
 
 Host resolution differs inside a container. A name that resolves on your machine
-— a tailnet MagicDNS name, an `/etc/hosts` entry — usually does **not** resolve
+- a tailnet MagicDNS name, an `/etc/hosts` entry - usually does **not** resolve
 inside a container, because Docker's embedded resolver does not see it.
 
 Test from inside the container, not from the host:
@@ -62,6 +62,6 @@ If the name fails and the IP works, use the IP.
 ## Sessions upload but you cannot find them
 
 Filter by the wrong field and everything looks missing. `origin.environment` is
-the CLASS of runtime (`local`, `vps`, `container`, `workflow`) — every
+the CLASS of runtime (`local`, `vps`, `container`, `workflow`) - every
 containerised run reports the same value. To tell deployments apart, filter on
 the deployment identity or on tags, not on the environment class.

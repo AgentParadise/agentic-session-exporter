@@ -17,6 +17,19 @@ pub struct Config {
     pub origin_host: String,
     /// Origin environment label (for example `laptop`, `vps`, `mini`).
     pub origin_environment: String,
+    /// OPTIONAL deployment identity (APS-V1-0004 2.0.0 `origin.deployment`),
+    /// from `SESSION_STORE_ORIGIN_DEPLOYMENT`.
+    ///
+    /// Answers a DIFFERENT question from `origin_environment`, which is the
+    /// CLASS of runtime (`local`, `vps`, `container`, `workflow`). Every
+    /// containerised run reports the same class, so without this a multi-tier
+    /// install is unattributable: dev, beta and prod are indistinguishable once
+    /// the sessions reach a store.
+    ///
+    /// No default. Absent is a meaningful answer - a single-deployment machine
+    /// genuinely has none - and inventing one would put a fabricated identity
+    /// on every laptop session.
+    pub origin_deployment: Option<String>,
     /// Claude projects root. Defaults to `~/.claude/projects`.
     pub claude_root: PathBuf,
     /// Codex sessions root. Defaults to `~/.codex/sessions`.
@@ -87,6 +100,7 @@ impl Config {
             .unwrap_or_else(default_hostname);
         let origin_environment =
             env::var("SESSION_STORE_ORIGIN_ENV").unwrap_or_else(|_| "laptop".to_string());
+        let origin_deployment = non_empty(env::var("SESSION_STORE_ORIGIN_DEPLOYMENT").ok());
 
         let claude_root = env::var_os("CLAUDE_PROJECTS_ROOT")
             .map(PathBuf::from)
@@ -148,6 +162,7 @@ impl Config {
             store_url: store_url.trim_end_matches('/').to_string(),
             write_token,
             origin_host,
+            origin_deployment,
             origin_environment,
             claude_root,
             codex_root,
@@ -654,6 +669,65 @@ mod tests {
         assert_eq!(
             default_state_file(home, ""),
             home.join(".cache/seshmagic-session-store/exporter-state-unknown-host.json")
+        );
+    }
+}
+
+#[cfg(test)]
+mod deployment_tests {
+    use super::*;
+
+    /// `origin.deployment` is the field APS-V1-0004 2.0.0 added, and the reason
+    /// this crate needed the major bump. These pin that it reaches the config
+    /// and that absent stays absent.
+    #[test]
+    fn deployment_is_absent_when_unset() {
+        // Absent is a real answer, not a missing one: a single-deployment
+        // machine genuinely has no deployment identity, and inventing one would
+        // put a fabricated value on every laptop session.
+        temp_env::with_vars(
+            [
+                ("SESSION_STORE_URL", Some("http://store.example")),
+                ("SESSION_STORE_ORIGIN_DEPLOYMENT", None),
+            ],
+            || {
+                let cfg = Config::from_env().expect("config");
+                assert!(cfg.origin_deployment.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn deployment_is_read_and_namespaces() {
+        temp_env::with_vars(
+            [
+                ("SESSION_STORE_URL", Some("http://store.example")),
+                (
+                    "SESSION_STORE_ORIGIN_DEPLOYMENT",
+                    Some("syntropic137__prod"),
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().expect("config");
+                assert_eq!(cfg.origin_deployment.as_deref(), Some("syntropic137__prod"));
+            },
+        );
+    }
+
+    #[test]
+    fn an_empty_deployment_is_treated_as_absent() {
+        // An empty string is what an unset shell variable expands to in a
+        // container entrypoint. Storing "" would be a deployment identity of
+        // nothing, which a store would group on as its own source.
+        temp_env::with_vars(
+            [
+                ("SESSION_STORE_URL", Some("http://store.example")),
+                ("SESSION_STORE_ORIGIN_DEPLOYMENT", Some("")),
+            ],
+            || {
+                let cfg = Config::from_env().expect("config");
+                assert!(cfg.origin_deployment.is_none());
+            },
         );
     }
 }

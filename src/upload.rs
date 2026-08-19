@@ -264,10 +264,7 @@ mod tests {
     fn envelope(id: &str) -> SessionEnvelope {
         SessionEnvelope {
             scs_version: SCS_VERSION.to_string(),
-            origin: Origin {
-                host: "h".into(),
-                environment: "test".into(),
-            },
+            origin: Origin::new("h", "test"),
             agent: "Cursor".into(),
             source_format: "cursor-state-vscdb".into(),
             session_id: id.into(),
