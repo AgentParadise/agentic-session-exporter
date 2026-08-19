@@ -46,6 +46,11 @@ every run looks like a different machine and none of them are findable.
 | long-lived server | `vps` | a stable name |
 | CI or orchestrated workspace | the deployment, e.g. `myapp__prod` | something that outlives the container, e.g. the worker node |
 
+`ORIGIN_ENV` is a free string, so it namespaces: `myapp__prod` is app plus tier,
+`myapp__prod__eu` adds a region. A store splits on the FIRST `__`, so everything
+after it is the tier however many segments that is, and a value with no `__` is
+valid and renders flat.
+
 Stores group on the exact string, so pick values and keep them stable. Renaming
 later splits one source into two in every view.
 

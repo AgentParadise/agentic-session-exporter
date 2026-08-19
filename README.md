@@ -9,11 +9,11 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-8b9bb4?style=flat-square&labelColor=0d1117"></a>
-  <img alt="Rust 1.88+" src="https://img.shields.io/badge/rust-1.88%2B-8b9bb4?style=flat-square&labelColor=0d1117">
-  <img alt="Platforms" src="https://img.shields.io/badge/platforms-linux%20%C2%B7%20macos%20%C2%B7%20windows-8b9bb4?style=flat-square&labelColor=0d1117">
-  <img alt="Harnesses" src="https://img.shields.io/badge/harnesses-claude%20%C2%B7%20codex%20%C2%B7%20cursor-8b9bb4?style=flat-square&labelColor=0d1117">
-  <a href="#the-standard-this-implements"><img alt="Implements APS-V1-0004" src="https://img.shields.io/badge/implements-APS--V1--0004-2dd4a7?style=flat-square&labelColor=0d1117"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-8b9bb4?style=flat&labelColor=0d1117"></a>
+  <img alt="Rust 1.88+" src="https://img.shields.io/badge/rust-1.88%2B-8b9bb4?style=flat&labelColor=0d1117">
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-linux%20%C2%B7%20macos%20%C2%B7%20windows-8b9bb4?style=flat&labelColor=0d1117">
+  <img alt="Harnesses" src="https://img.shields.io/badge/harnesses-claude%20%C2%B7%20codex%20%C2%B7%20cursor-8b9bb4?style=flat&labelColor=0d1117">
+  <a href="#the-standard-this-implements"><img alt="Implements APS-V1-0004" src="https://img.shields.io/badge/implements-APS--V1--0004-2dd4a7?style=flat&labelColor=0d1117"></a>
 </p>
 
 # agentic-session-exporter
@@ -119,10 +119,27 @@ export SESSION_STORE_ORIGIN_ENV="myapp__prod"
 export SESSION_STORE_ORIGIN_HOST="worker-07"
 ```
 
-The `<app>__<tier>` shape in that last example is a convention, not a
-requirement. A store can split on the first `__` to group by app and then by
-tier, which is what turns a flat list of machines into something you can read at
-a glance.
+**`ORIGIN_ENV` is a namespace, not an enum.** It is a free string, so you can put
+a hierarchy in it, and the `<app>__<tier>` shape above is exactly that: two
+levels separated by a double underscore.
+
+```
+laptop                    one level,  no app
+myapp__prod               two levels, app and tier
+myapp__prod__eu           three,      if a region matters to you
+```
+
+A store splits on the FIRST `__`, so the part before it is the app and
+everything after is the tier, however many segments that turns out to be. A
+value with no `__` is perfectly valid and renders as a flat group, which is why
+plain `laptop` keeps working.
+
+Double underscore rather than a dot or a hyphen because app names and hostnames
+routinely contain dots and hyphens, and a separator that appears inside the
+values it separates is not a separator.
+
+None of this is enforced by the exporter. It sends the string you give it, and
+the convention only pays off if you keep it stable.
 
 ### Keep it running
 
