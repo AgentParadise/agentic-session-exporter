@@ -232,14 +232,39 @@ jobs:
           cosign sign --yes \
             "${REGISTRY}/${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
 
-      # Run the binary out of the image that was just built. A publish step that
-      # only proves an image EXISTS is not proof that it works.
-      - name: Verify the published image can actually execute the binary
+      # Verify the way a CONSUMER actually uses this image: COPY the binary out
+      # into a glibc base and run it there.
+      #
+      # The first version of this step ran the binary INSIDE the scratch image
+      # and failed with `exec: no such file or directory`. That was the check
+      # being wrong, not the artifact: the binaries are dynamically linked
+      # against glibc, and a scratch image has no dynamic linker, so nothing
+      # could ever execute there. The image exists to be copied FROM, never run.
+      #
+      # A verification that does not mirror the consumer path can fail on a good
+      # artifact and, worse, could pass on a bad one.
+      - name: Verify a consumer can COPY the binary out and run it
         if: inputs.dry_run != true
         run: |
           set -euo pipefail
           ref="${REGISTRY}/${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
-          docker run --rm --entrypoint /apss-session-exporter "$ref" --version
+          mkdir -p verify
+          cat > verify/Dockerfile <<DOCKER
+          FROM ${ref} AS exporter
+          FROM debian:12-slim
+          COPY --from=exporter /apss-session-exporter /usr/local/bin/
+          COPY --from=exporter /apss-session-reconstitute /usr/local/bin/
+          # RUN so the build FAILS if either binary cannot execute.
+          RUN /usr/local/bin/apss-session-exporter --version \
+           && /usr/local/bin/apss-session-reconstitute --version
+          DOCKER
+          # Both published architectures, because "works on amd64" has never
+          # been evidence about arm64.
+          for platform in linux/amd64 linux/arm64; do
+            echo "::group::verify ${platform}"
+            docker buildx build --platform "${platform}" --load=false verify
+            echo "::endgroup::"
+          done
 
       - name: Report the digest consumers should pin
         run: |

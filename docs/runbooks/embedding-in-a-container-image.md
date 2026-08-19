@@ -23,6 +23,19 @@ reaches production images that nobody rebuilt.
 **A `FROM scratch` source image.** It exists to be copied *from*, never run, so
 it contributes no attack surface.
 
+That last point is load-bearing, not a detail. The binaries are dynamically
+linked against glibc, so **you cannot run them inside the scratch image** - there
+is no dynamic linker there, and the attempt fails with
+
+```
+exec /apss-session-exporter: no such file or directory
+```
+
+which reads like a missing file and is actually a missing interpreter. Copy them
+into a base that has a libc (Debian, Ubuntu, distroless `cc`) and they run
+normally. An Alpine consumer needs a musl build, which this repo does not
+currently publish.
+
 ## Verify the image before bumping the pin
 
 ```bash
