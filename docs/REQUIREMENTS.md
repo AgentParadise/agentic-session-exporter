@@ -29,7 +29,33 @@ its own fields back is not coverage; it is a tautology that happens to execute
 lines. Parsers get real transcript fixtures, the uploader gets a fake store, and
 the CLI gets black-box invocation asserting exit codes and stdout.
 
-## 3. Cross-platform release matrix
+### Current state, honestly
+
+The library is at 100%. The gap is entirely the two CLI entry points:
+`src/bin/exporter.rs` at 57% and `src/bin/reconstitute.rs` at 68%. CI gates at
+the measured floor and ratchets up; it does not gate at 100 and stay red, which
+teaches everyone to ignore it.
+
+That gap matters more than the percentage suggests: the CLI is the contract
+agentic-primitives' doctor and finalizer actually depend on. The `--version`
+probe that a consumer once "passed" by performing a real upload was a CLI
+contract defect, and black-box CLI tests are what would have caught it.
+
+## 4. Branching and release
+
+`main` is development. `release` is what publishes.
+
+A PR into `release` must clear a gate that is deliberately stricter than CI: the
+version is bumped and not already tagged, `Cargo.lock` is in sync, every one of
+the five platforms builds in release mode, and the OCI image builds multi-arch.
+None of those should first be discovered while a tag is half-cut.
+
+Tagging `v*` on `release` publishes: binaries, one `SHA256SUMS` manifest, one
+cosign signature over that manifest, and the signed OCI image. One signature
+over a manifest rather than N signatures over N files - it is the same guarantee
+with a fraction of the verification burden.
+
+## 5. Cross-platform release matrix
 
 The same binary runs in three quite different places, and all of them are
 first-class:
@@ -49,7 +75,7 @@ consumer image can `COPY --from=<image>@sha256:...` by immutable digest. A
 GitHub release asset cannot be used that way, and telling image authors to
 `curl` a tarball at build time is how unverified binaries end up in images.
 
-## 4. Harnesses are a registry, not a hardcoded list
+## 6. Harnesses are a registry, not a hardcoded list
 
 The exporter reads transcripts written by agent harnesses. Today: **Claude
 Code**, **Codex**, **Cursor**. That list will grow, and adding to it must be a
@@ -79,7 +105,7 @@ parser without a real transcript behind it is an assumption.
 | Codex | `codex-turns-v1` | `~/.codex/sessions` | `CODEX_SESSIONS_ROOT` |
 | Cursor | (SQLite state db) | Cursor state database | `CURSOR_STATE_DB` |
 
-## 5. Never lose or leak a session
+## 7. Never lose or leak a session
 
 Two failure modes matter more than throughput:
 

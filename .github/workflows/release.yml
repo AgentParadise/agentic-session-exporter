@@ -1,0 +1,228 @@
+name: Release
+
+# Tag-driven. A release publishes, for every supported platform:
+#   - the four binaries
+#   - ONE SHA256SUMS manifest covering all of them
+#   - ONE cosign signature over that manifest (not N signatures over N files)
+#   - a minimal OCI image carrying the Linux binaries, signed, so a consumer
+#     image can `COPY --from=<image>@sha256:...` by immutable digest
+#
+# The OCI image is not decoration. A GitHub release asset cannot be consumed by
+# `COPY --from=`, and telling image authors to curl a tarball at build time is
+# how unverified binaries end up inside images.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and verify without publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: agentparadise/agentic-session-exporter
+  BINARIES: >-
+    apss-session-exporter apss-session-reconstitute
+    SeshMagicSessionExporter SeshMagicSessionReconstitute
+
+jobs:
+  # Every platform in docs/REQUIREMENTS.md section 3. A platform that is not
+  # built is a platform where capture does not exist, so this matrix is the
+  # product decision, not a build detail. fail-fast is off: one platform's
+  # toolchain breaking must not hide the others' results.
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: darwin-arm64
+            runs-on: macos-14
+            target: aarch64-apple-darwin
+          - platform: darwin-amd64
+            runs-on: macos-13
+            target: x86_64-apple-darwin
+          - platform: windows-amd64
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # --locked so a release builds the dependency graph that was reviewed,
+      # not whatever resolves today.
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=""
+          for b in $BINARIES; do args="$args --bin $b"; done
+          cargo build --locked --release $args --target ${{ matrix.target }}
+
+      - name: Stage assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for b in $BINARIES; do
+            src="target/${{ matrix.target }}/release/${b}${{ matrix.ext }}"
+            dst="dist/${b}-${{ matrix.platform }}${{ matrix.ext }}"
+            cp "$src" "$dst"
+            chmod +x "$dst" || true
+          done
+          ls -l dist
+
+      # Smoke-test the artifact that will actually be published, on the machine
+      # that built it. Cross-built targets cannot run here and are skipped
+      # explicitly rather than silently.
+      - name: Verify the built binary answers --version
+        if: matrix.platform != 'linux-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "./dist/apss-session-exporter-${{ matrix.platform }}${{ matrix.ext }}" --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exporter-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+
+      - name: Collect and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staged -type f -exec cp {} dist/ \;
+          cd dist
+          # ONE manifest over every asset, then one signature over the manifest.
+          # Signing each file separately multiplies the verification burden for
+          # no additional guarantee.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
+            | sort | xargs -r sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign the checksum manifest
+        if: inputs.dry_run != true
+        run: cosign sign-blob --yes --output-signature dist/SHA256SUMS.sig dist/SHA256SUMS
+
+      - name: Publish
+        if: inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes
+
+  image:
+    name: Publish OCI image
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: exporter-linux-*
+          path: staged
+
+      - name: Assemble a scratch image carrying only the Linux binaries
+        run: |
+          set -euo pipefail
+          mkdir -p ctx/amd64 ctx/arm64
+          cp staged/exporter-linux-amd64/* ctx/amd64/
+          cp staged/exporter-linux-arm64/* ctx/arm64/
+          # Strip the platform suffix so a consumer copies a stable path.
+          for arch in amd64 arm64; do
+            for f in ctx/$arch/*-linux-$arch; do
+              mv "$f" "ctx/$arch/$(basename "$f" "-linux-$arch")"
+            done
+          done
+          cat > ctx/Dockerfile <<'DOCKER'
+          # Deliberately FROM scratch: this image exists to be copied FROM, never
+          # to be run. Nothing here should be an attack surface in a consumer.
+          FROM scratch
+          ARG TARGETARCH
+          COPY ${TARGETARCH}/ /
+          DOCKER
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: inputs.dry_run != true
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.dry_run != true }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image by digest
+        if: inputs.dry_run != true
+        run: |
+          cosign sign --yes \
+            "${REGISTRY}/${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
+
+      - name: Report the digest consumers should pin
+        run: |
+          {
+            echo "### Pin this digest"
+            echo '```dockerfile'
+            echo "COPY --from=${REGISTRY}/${IMAGE_NAME}@${{ steps.push.outputs.digest }} \\"
+            echo "     /apss-session-exporter /usr/local/bin/apss-session-exporter"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

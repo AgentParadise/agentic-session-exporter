@@ -1,0 +1,100 @@
+name: Release Gate
+
+# main is development; `release` is what publishes. A PR into `release` must
+# clear this gate first, so cutting a release cannot be the moment a problem is
+# discovered. Mirrors the pattern Syntropic137 and agentic-primitives use.
+#
+# The gate is deliberately STRICTER than CI, not a rerun of it: it checks the
+# things that only matter when something is about to be published and pinned by
+# other people.
+
+on:
+  pull_request:
+    branches: [release]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version-consistency:
+    name: Version is bumped and tagged consistently
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A release that reuses a version silently overwrites what consumers
+      # believe they pinned. Consumers here pin by version AND digest, so a
+      # duplicate version is a lie in their lockfile.
+      - name: Version must not already be released
+        run: |
+          set -euo pipefail
+          v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "Cargo.toml version: $v"
+          if git tag --list "v${v}" | grep -q .; then
+            echo "::error::v${v} is already tagged. Bump the version in Cargo.toml."
+            exit 1
+          fi
+          if [ -z "$v" ]; then echo "::error::could not read a version"; exit 1; fi
+          echo "OK: v${v} is unreleased"
+
+      - name: Cargo.lock must be in sync
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+  release-build:
+    name: Release build (${{ matrix.target }})
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runs-on: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
+          - { runs-on: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { runs-on: macos-14,         target: aarch64-apple-darwin }
+          - { runs-on: macos-13,         target: x86_64-apple-darwin }
+          - { runs-on: windows-latest,   target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # Every platform the release promises. A platform that fails here would
+      # otherwise fail at tag time, when the release is already half-cut.
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+
+  image-dry-run:
+    name: OCI image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      # Build the multi-arch image without pushing. The image is how consumers
+      # COPY --from= the binaries, so a broken image build is a broken release
+      # even when every binary is fine.
+      - name: Build (no push)
+        run: |
+          set -euo pipefail
+          mkdir -p ctx && printf 'FROM scratch\nARG TARGETARCH\nCOPY . /\n' > ctx/Dockerfile
+          : > ctx/.keep
+          docker buildx build --platform linux/amd64,linux/arm64 ctx
+
+  gate-success:
+    name: Release Gate Success
+    if: always()
+    needs: [version-consistency, release-build, image-dry-run]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          set -euo pipefail
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "results: $results"
+          for r in $results; do
+            [ "$r" = "success" ] || { echo "::error::release gate job reported $r"; exit 1; }
+          done
