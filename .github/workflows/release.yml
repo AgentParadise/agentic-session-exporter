@@ -44,12 +44,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # musl, not gnu, and deliberately. A gnu build records the glibc
+          # floor of whatever runner image GitHub currently points
+          # ubuntu-latest at - that moved to 24.04 (glibc 2.39), which made
+          # the binaries unrunnable on Debian 12 (2.36) and broke the consumer
+          # smoke test below. musl links the C runtime statically, so the
+          # binaries carry no libc floor at all and run on any Linux. That
+          # matters more here than usual: these get COPY'd into other people's
+          # images, whose base distro we do not choose.
           - platform: linux-amd64
             runs-on: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - platform: linux-arm64
             runs-on: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
           - platform: darwin-arm64
             runs-on: macos-14
             target: aarch64-apple-darwin
@@ -68,6 +76,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # rusqlite is built with the `bundled` feature, so it compiles SQLite
+      # from C source and needs a musl-targeting C compiler.
+      - name: Install the musl toolchain
+        if: startsWith(matrix.platform, 'linux-')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -100,11 +114,32 @@ jobs:
       # that built it. Cross-built targets cannot run here and are skipped
       # explicitly rather than silently.
       - name: Verify the built binary answers --version
-        if: matrix.platform != 'linux-arm64' && matrix.platform != 'darwin-amd64'
+        if: matrix.platform != 'darwin-amd64'
         shell: bash
         run: |
           set -euo pipefail
-          "./dist/apss-session-exporter-${{ matrix.platform }}${{ matrix.ext }}" --version
+          for b in $BINARIES; do
+            "./dist/${b}-${{ matrix.platform }}${{ matrix.ext }}" --version
+          done
+
+      # The check that would have caught the 2.39 break at build time instead
+      # of at the consumer smoke test. A dynamically linked Linux binary is a
+      # release blocker: it carries the runner's glibc floor into every image
+      # that COPYs it.
+      - name: Assert the Linux binaries are statically linked
+        if: startsWith(matrix.platform, 'linux-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for b in $BINARIES; do
+            f="./dist/${b}-${{ matrix.platform }}"
+            if ! file "$f" | grep -q 'statically linked'; then
+              echo "::error::$f is not statically linked:"
+              file "$f"
+              exit 1
+            fi
+            echo "ok: $f"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
