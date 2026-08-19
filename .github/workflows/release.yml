@@ -126,6 +126,26 @@ jobs:
       # of at the consumer smoke test. A dynamically linked Linux binary is a
       # release blocker: it carries the runner's glibc floor into every image
       # that COPYs it.
+      # The check that actually reproduces the consumer environment, and the
+      # one whose absence let the glibc 2.39 break reach a published tag. The
+      # runner's own glibc is NEWER than the oldest base we support, so running
+      # a binary here proves nothing about whether it runs THERE. Debian 12 is
+      # the floor because it is what the consuming workspace image is built on.
+      #
+      # Both linux runners are native (amd64 and arm64), so each pulls the
+      # matching debian and needs no emulation. This runs on dry runs too,
+      # unlike the image-level consumer check further down, which is why it is
+      # here rather than only in the OCI job.
+      - name: Verify the Linux binaries run on the oldest supported base
+        if: startsWith(matrix.platform, 'linux-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for b in $BINARIES; do
+            docker run --rm -v "$PWD/dist:/dist:ro" debian:12-slim \
+              "/dist/${b}-${{ matrix.platform }}" --version
+          done
+
       - name: Assert the Linux binaries are statically linked
         if: startsWith(matrix.platform, 'linux-')
         shell: bash
@@ -255,6 +275,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      # github.ref_name is a branch name on a workflow_dispatch, and a branch
+      # name may contain "/", which is not a valid docker tag. That made a dry
+      # run dispatched from a feature branch fail on an invalid reference
+      # before it reached any of the checks it exists to run. `latest` is
+      # withheld unless this is a real tag, so a dispatch can never move it.
+      - name: Compute the image tag
+        id: imagetag
+        run: |
+          set -euo pipefail
+          t="${GITHUB_REF_NAME//\//-}"
+          echo "value=${t}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push
         id: push
         uses: docker/build-push-action@v6
@@ -263,8 +300,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ inputs.dry_run != true }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.imagetag.outputs.value }}
+            ${{ steps.imagetag.outputs.latest == 'true' && format('{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME) || '' }}
 
       - uses: sigstore/cosign-installer@v3
 
