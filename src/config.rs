@@ -70,6 +70,13 @@ pub struct Config {
 /// Configuration errors surfaced at startup.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// SESSION_STORE_ORIGIN_ENV was set to something the standard does not
+    /// define. Refused rather than passed through: the field is a REQUIRED
+    /// enum, and a store filtering on the defined classes silently misses
+    /// anything else.
+    #[error("SESSION_STORE_ORIGIN_ENV must be one of local, vps, container, workflow (got {0:?})")]
+    InvalidEnvironment(String),
+
     #[error("missing required env var {0}")]
     Missing(&'static str),
     #[error("could not determine home directory (set HOME)")]
@@ -92,6 +99,12 @@ pub enum ConfigError {
 ///
 /// An operator who knows better sets the variable; this only decides what
 /// happens when nobody said.
+/// The only values APS-V1-0004 4.2.1 defines for `origin.environment`.
+///
+/// Enforced rather than documented. Accepting any non-empty string is how
+/// "laptop" shipped into a required enum field and stayed there.
+pub const ENVIRONMENT_CLASSES: [&str; 4] = ["local", "vps", "container", "workflow"];
+
 fn detect_environment_class() -> String {
     // The markers the major runtimes leave: /.dockerenv is Docker,
     // /run/.containerenv is Podman, and the cgroup path catches the rest.
@@ -130,8 +143,11 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(default_hostname);
-        let origin_environment = non_empty(env::var("SESSION_STORE_ORIGIN_ENV").ok())
-            .unwrap_or_else(detect_environment_class);
+        let origin_environment = match non_empty(env::var("SESSION_STORE_ORIGIN_ENV").ok()) {
+            Some(v) if ENVIRONMENT_CLASSES.contains(&v.as_str()) => v,
+            Some(v) => return Err(ConfigError::InvalidEnvironment(v)),
+            None => detect_environment_class(),
+        };
         let origin_deployment = non_empty(env::var("SESSION_STORE_ORIGIN_DEPLOYMENT").ok());
 
         let claude_root = env::var_os("CLAUDE_PROJECTS_ROOT")
@@ -510,6 +526,26 @@ mod tests {
                 ("SESSION_STORE_ORIGIN_DEPLOYMENT", ""),
             ],
             || assert!(Config::from_env().unwrap().origin_deployment.is_none()),
+        );
+    }
+
+    #[test]
+    fn a_value_outside_the_standard_enum_is_refused() {
+        // "laptop" was the shipped default for months and is not one of the
+        // four classes 4.2.1 defines. Accepting any non-empty string is how it
+        // survived; the field is a REQUIRED enum, so this refuses instead.
+        with_env(
+            &[
+                ("SESSION_STORE_URL", "http://store.example"),
+                ("HOME", "/tmp/exporter-home-enum"),
+                ("SESSION_STORE_ORIGIN_ENV", "laptop"),
+            ],
+            || {
+                assert!(matches!(
+                    Config::from_env(),
+                    Err(ConfigError::InvalidEnvironment(v)) if v == "laptop"
+                ));
+            },
         );
     }
 

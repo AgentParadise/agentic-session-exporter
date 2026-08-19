@@ -28,7 +28,7 @@ Omit the token only if the store genuinely accepts unauthenticated writes.
 ## 2b. Say where the sessions came from
 
 ```bash
-export SESSION_STORE_ORIGIN_ENV="laptop"       # default: laptop
+export SESSION_STORE_ORIGIN_ENV="local"        # local|vps|container|workflow
 export SESSION_STORE_ORIGIN_HOST="$(hostname)" # default: the machine hostname
 ```
 
@@ -42,9 +42,9 @@ every run looks like a different machine and none of them are findable.
 
 | Where it runs | `ORIGIN_ENV` | `ORIGIN_HOST` |
 | --- | --- | --- |
-| developer laptop | `laptop` | hostname is fine |
+| developer laptop | `local` | hostname is fine |
 | long-lived server | `vps` | a stable name |
-| CI or orchestrated workspace | the deployment, e.g. `myapp__prod` | something that outlives the container, e.g. the worker node |
+| CI or orchestrated workspace | `workflow` (put the deployment in ORIGIN_DEPLOYMENT) | something that outlives the container, e.g. the worker node |
 
 `ORIGIN_ENV` is a free string, so it namespaces: `myapp__prod` is app plus tier,
 `myapp__prod__eu` adds a region. A store splits on the FIRST `__`, so everything
