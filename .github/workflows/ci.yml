@@ -106,8 +106,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runs-on: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
-          - { runs-on: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          # musl, matching release.yml. These must stay identical: this job
+          # exists so a release platform cannot fail for the first time at tag
+          # time, which it can do again the moment the two lists diverge.
+          - { runs-on: ubuntu-latest,  target: x86_64-unknown-linux-musl }
+          - { runs-on: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { runs-on: macos-14,       target: aarch64-apple-darwin }
           - { runs-on: macos-14,       target: x86_64-apple-darwin }  # cross-compiled: macos-13 starves
           - { runs-on: windows-latest, target: x86_64-pc-windows-msvc }
@@ -116,6 +119,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # rusqlite is `bundled`, so it compiles SQLite from C source and needs a
+      # musl-targeting C compiler.
+      - name: Install the musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
       # Every release platform must build on every PR. Discovering that Windows
       # does not compile at tag time means the release is already broken.
