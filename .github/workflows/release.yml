@@ -182,6 +182,19 @@ jobs:
               mv "$f" "ctx/$arch/$(basename "$f" "-linux-$arch")"
             done
           done
+
+          # RESTORE THE EXECUTABLE BIT. upload-artifact/download-artifact do not
+          # preserve file modes, so the build job's chmod +x is lost in transit
+          # and every binary arrives 0644. Without this the image publishes
+          # successfully and then fails at the only moment that matters:
+          #
+          #   exec: "/apss-session-exporter": permission denied
+          #
+          # Found by running the published v0.1.0 image rather than trusting a
+          # green pipeline. A build that succeeds and produces an unusable
+          # artifact is the worst kind of green.
+          chmod +x ctx/amd64/* ctx/arm64/*
+          ls -l ctx/amd64
           cat > ctx/Dockerfile <<'DOCKER'
           # Deliberately FROM scratch: this image exists to be copied FROM, never
           # to be run. Nothing here should be an attack surface in a consumer.
@@ -218,6 +231,15 @@ jobs:
         run: |
           cosign sign --yes \
             "${REGISTRY}/${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
+
+      # Run the binary out of the image that was just built. A publish step that
+      # only proves an image EXISTS is not proof that it works.
+      - name: Verify the published image can actually execute the binary
+        if: inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          ref="${REGISTRY}/${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
+          docker run --rm --entrypoint /apss-session-exporter "$ref" --version
 
       - name: Report the digest consumers should pin
         run: |
