@@ -1,23 +1,108 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="agentic-session-exporter" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/AgentParadise/agentic-session-exporter/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/AgentParadise/agentic-session-exporter/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/AgentParadise/agentic-session-exporter/actions/workflows/release.yml"><img alt="Release" src="https://github.com/AgentParadise/agentic-session-exporter/actions/workflows/release.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="Rust" src="https://img.shields.io/badge/rust-1.88%2B-orange.svg">
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS%20%7C%20windows-lightgrey.svg">
+  <img alt="Signed" src="https://img.shields.io/badge/artifacts-cosign%20signed-green.svg">
+  <img alt="Standard" src="https://img.shields.io/badge/APS--V1--0004-Exporter%20profile-7c5cff.svg">
+</p>
+
 # agentic-session-exporter
 
-Reference client for the **APS-V1-0004 session-capture Exporter profile**.
-
-It reads agent transcripts written on the local machine, wraps each one in an
-SCS envelope with the provider's bytes preserved verbatim, and uploads it to any
-conformant session store.
+Your agent sessions are written to disk by whichever harness produced them, in
+whatever shape that harness felt like, and then they sit there. This reads them,
+wraps each one in an **SCS envelope** with the provider's bytes preserved
+verbatim, and uploads it to a session store you choose.
 
 It is a client of a **standard**, not of a product. It depends on
 `apss-v1-0004-session-capture` and third-party crates, and on no store
-implementation. Point it at whichever store you run.
+implementation whatsoever. Point it at whichever store you run.
 
-## Where it runs
+## Quick start
 
-The same binary is used in three places, and none is an afterthought:
+Capture the sessions already on your machine:
 
-- **a developer laptop**, capturing local Claude / Codex / Cursor sessions
-- **a VPS or long-lived box**, the same
-- **inside a workspace container**, invoked by the agentic-primitives
-  session-store capability at finalize
+```bash
+export SESSION_STORE_URL="https://sessions.example.com"
+export SESSIONS_WRITE_TOKEN="…"        # omit for an unauthenticated store
+
+apss-session-exporter --dry-run        # see what it would send, upload nothing
+apss-session-exporter                  # sweep and upload
+apss-session-exporter --health         # is the store reachable?
+```
+
+It discovers transcripts in each harness's default location, so there is usually
+nothing else to configure. Nothing is uploaded twice: the store deduplicates on
+`content_hash`, so re-running a sweep is always safe.
+
+Keep it running:
+
+```bash
+apss-session-exporter --loop           # sweep continuously
+```
+
+Bring a session back to another machine and resume it natively:
+
+```bash
+apss-session-reconstitute <session-id>
+```
+
+## Supported harnesses
+
+| Harness | `source_format` | Read from | Override with |
+| --- | --- | --- | --- |
+| Claude Code | `claude-jsonl-v1` | `~/.claude/projects` | `CLAUDE_PROJECTS_ROOT` |
+| Codex | `codex-turns-v1` | `~/.codex/sessions` | `CODEX_SESSIONS_ROOT` |
+| Cursor | SQLite state db | Cursor's state database | `CURSOR_STATE_DB` |
+
+Adding one is meant to be a small, contained change — one module, registered.
+See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) section 6 for the shape a
+harness has to take, and why the rest of the pipeline must not need editing.
+
+## Supported machines
+
+Every release publishes all five, signed, with checksums:
+
+| Platform | Target | Typical use |
+| --- | --- | --- |
+| Linux x86-64 | `x86_64-unknown-linux-gnu` | workspace containers, servers |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | ARM containers, ARM servers |
+| macOS Apple Silicon | `aarch64-apple-darwin` | developer laptops |
+| macOS Intel | `x86_64-apple-darwin` | developer laptops |
+| Windows x86-64 | `x86_64-pc-windows-msvc` | developer laptops |
+
+A platform that is not built is a platform where capture does not exist, so this
+list is a product decision rather than a build detail.
+
+## Install
+
+**From a release** — download the binary for your platform, then verify before
+trusting it:
+
+```bash
+# One manifest covers every asset; one signature covers the manifest.
+cosign verify-blob --signature SHA256SUMS.sig \
+  --certificate-identity-regexp 'https://github.com/AgentParadise/agentic-session-exporter/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+sha256sum --check SHA256SUMS --ignore-missing
+```
+
+**Into a container image** — copy from the published OCI image by digest, never
+by tag:
+
+```dockerfile
+COPY --from=ghcr.io/agentparadise/agentic-session-exporter@sha256:… \
+     /apss-session-exporter /usr/local/bin/apss-session-exporter
+```
+
+A digest is the only immutable reference. Pinning a tag means an upstream push
+silently changes what your image ships.
 
 ## Binaries
 
@@ -32,26 +117,28 @@ pre-rename names. They are scheduled for removal in a declared major release,
 never silently: an operator whose capture stops with no message is worse off
 than one told to rename a file.
 
-The `apss-` prefix is deliberate. This is the reference client of a standard, so
+The `apss-` prefix is deliberate — this is the reference client of a standard, so
 its executables are named for the standard rather than for a vendor or for this
 repository.
 
-## Supported harnesses
+## Documentation
 
-Claude Code, Codex, and Cursor. Adding another is meant to be a small, obvious
-change — see [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) §4 for the shape a
-harness has to take and why the rest of the pipeline must not need editing.
+| | |
+| --- | --- |
+| [Requirements](docs/REQUIREMENTS.md) | what this repo is held to, and why |
+| [Quick start runbook](docs/runbooks/quick-start.md) | first capture, start to finish |
+| [Container embedding](docs/runbooks/embedding-in-a-container-image.md) | baking it into a workspace image |
+| [Troubleshooting](docs/runbooks/troubleshooting.md) | when nothing is arriving |
 
-## Requirements that govern this repo
+## Security
 
-[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md): Rust and standalone, 100% test
-coverage, a five-platform signed release matrix plus an OCI image for
-`COPY --from=`, harnesses as a registry, and never lose or leak a session.
+Artifacts are signed with cosign keyless OIDC. The write token is never printed
+to stdout, stderr, or a log line — [there is a test for it](tests/cli.rs),
+because this binary's output is routinely captured into durable logs by whatever
+invokes it.
 
-## Status
+Report vulnerabilities privately via GitHub Security Advisories.
 
-Extracted from a private store repository so that a workspace image can embed it
-without depending on one vendor's product. Pinned to
-`apss-v1-0004-session-capture` **1.0.0** at present: 2.0.0 carries
-`origin.deployment` and is merged upstream but not yet published to crates.io,
-so `origin.deployment` cannot be stamped until that release lands.
+## License
+
+MIT — see [LICENSE](LICENSE).

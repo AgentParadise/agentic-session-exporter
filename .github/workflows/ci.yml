@@ -24,15 +24,15 @@ env:
   # Current state, and it is a precise gap rather than diffuse thinness:
   #   library modules ......... 100% (config, cursor, gitmeta, health, lib,
   #                             parsers, sources, state, upload; reconstitute 98.96)
-  #   src/bin/exporter.rs ..... 57.34%
-  #   src/bin/reconstitute.rs . 67.57%
+  #   src/bin/exporter.rs ..... 81.23%  (was 57.34% before tests/cli.rs)
+  #   src/bin/reconstitute.rs . 67.57%  (no black-box tests yet - next)
   #
   # So the untested surface is the CLI entry points - argument parsing, exit
   # codes, and the stdout contract - which is exactly what REQUIREMENTS s2 says
   # needs black-box invocation tests. Those tests are the work that closes this,
   # and they are worth more than the percentage: the CLI is the contract
   # agentic-primitives' doctor and finalizer actually depend on.
-  COVERAGE_MIN: "96"
+  COVERAGE_MIN: "97"
 
 jobs:
   test:

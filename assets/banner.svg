@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 260" role="img" aria-label="agentic-session-exporter: reference client for the APS-V1-0004 session-capture Exporter profile">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1020"/>
+      <stop offset="55%" stop-color="#131a33"/>
+      <stop offset="100%" stop-color="#1b2145"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#4f9cf9"/>
+      <stop offset="50%" stop-color="#7c5cff"/>
+      <stop offset="100%" stop-color="#31d0aa"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="260" fill="url(#bg)"/>
+  <g opacity="0.16" stroke="url(#accent)" stroke-width="1.5" fill="none">
+    <path d="M60 196 L180 196 L214 128 L268 128"/>
+    <path d="M60 150 L150 150 L184 82 L268 82"/>
+    <path d="M60 242 L210 242 L244 174 L268 174"/>
+  </g>
+  <g fill="none" stroke="url(#accent)" stroke-width="3">
+    <circle cx="292" cy="82" r="9"/><circle cx="292" cy="128" r="9"/><circle cx="292" cy="174" r="9"/>
+    <path d="M301 82 C 350 82, 350 128, 399 128"/>
+    <path d="M301 128 L399 128"/>
+    <path d="M301 174 C 350 174, 350 128, 399 128"/>
+    <rect x="399" y="104" width="48" height="48" rx="12"/>
+    <path d="M447 128 L520 128"/>
+    <path d="M520 108 L560 128 L520 148 Z" fill="url(#accent)" stroke="none"/>
+  </g>
+  <text x="612" y="106" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="40" fill="#eef2ff" letter-spacing="-0.5">agentic-session-exporter</text>
+  <text x="614" y="146" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="19" fill="#9fb0d9">Reference client for the APS-V1-0004 Exporter profile</text>
+  <text x="614" y="180" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="16" fill="#6f80ab">Claude Code &#183; Codex &#183; Cursor &#8594; any conformant session store</text>
+  <rect x="614" y="200" width="182" height="30" rx="15" fill="none" stroke="#31d0aa" stroke-width="1.5"/>
+  <text x="632" y="220" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" fill="#31d0aa">signed &#183; multi-platform</text>
+</svg>

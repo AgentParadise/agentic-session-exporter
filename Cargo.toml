@@ -3,6 +3,7 @@ name = "agentic-session-exporter"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+readme = "README.md"
 rust-version = "1.88"
 description = "Reference client for the APS-V1-0004 session-capture Exporter profile: reads local agent transcripts and uploads SCS envelopes (raw verbatim) to any conformant store."
 repository = "https://github.com/AgentParadise/agentic-session-exporter"
@@ -57,3 +58,10 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# `coverage_nightly` is set by cargo-llvm-cov, not by us. Without declaring it
+# here, clippy fails every build that carries a coverage exclusion attribute -
+# which is every build, since the exclusions are how untestable branches are
+# marked. Declaring it keeps `-D warnings` meaningful instead of noisy.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }

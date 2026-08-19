@@ -31,8 +31,9 @@ the CLI gets black-box invocation asserting exit codes and stdout.
 
 ### Current state, honestly
 
-The library is at 100%. The gap is entirely the two CLI entry points:
-`src/bin/exporter.rs` at 57% and `src/bin/reconstitute.rs` at 68%. CI gates at
+The library is at 100%. The gap is the two CLI entry points: `src/bin/exporter.rs`
+at 81% (was 57% before `tests/cli.rs`) and `src/bin/reconstitute.rs` at 68%,
+which has no black-box tests yet. Total 97.52%. CI gates at
 the measured floor and ratchets up; it does not gate at 100 and stay red, which
 teaches everyone to ignore it.
 
