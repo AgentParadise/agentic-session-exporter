@@ -147,3 +147,85 @@ fn the_write_token_never_appears_in_output() {
         "the write token must never reach stdout or stderr"
     );
 }
+
+/// A sweep against an unreachable store must not look like a success.
+///
+/// This is the defect the `--json` work exists to close: before it, a caller
+/// could only ask the exit status, and a sweep that captured nothing still
+/// exited 0. Exercised through the real binary rather than the internals,
+/// because the exit code IS the interface a host-side caller uses.
+#[test]
+fn an_unreachable_store_never_exits_zero() {
+    let tmp = std::env::temp_dir().join("apss-cli-unreachable");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("claude/p")).expect("fixture dirs");
+    std::fs::write(
+        tmp.join("claude/p/s.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\
+         \"sessionId\":\"cli-test\",\"timestamp\":\"2026-08-19T00:00:00Z\"}\n",
+    )
+    .expect("fixture file");
+
+    let out = bin()
+        .arg("--json")
+        // Port 1 is not listening, so every upload fails.
+        .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+        .env("SESSION_STORE_ORIGIN_ENV", "container")
+        .env("CLAUDE_PROJECTS_ROOT", tmp.join("claude"))
+        .env("CODEX_SESSIONS_ROOT", tmp.join("codex"))
+        .env("EXPORTER_STATE_FILE", tmp.join("state.json"))
+        .env("EXPORTER_HEALTH_FILE", tmp.join("health.json"))
+        .env("HOME", &tmp)
+        .output()
+        .expect("binary should run");
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a sweep that stored nothing must not report success; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// With `--json`, stdout carries the machine result and nothing else.
+///
+/// Diagnostics default to stdout in this binary, which would interleave log
+/// lines with the document and hand a consumer a stream it cannot parse.
+#[test]
+fn json_mode_keeps_stdout_machine_readable() {
+    let tmp = std::env::temp_dir().join("apss-cli-jsonstream");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("claude")).expect("fixture dirs");
+
+    let out = bin()
+        .arg("--json")
+        .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+        .env("SESSION_STORE_ORIGIN_ENV", "container")
+        .env("CLAUDE_PROJECTS_ROOT", tmp.join("claude"))
+        .env("CODEX_SESSIONS_ROOT", tmp.join("codex"))
+        .env("EXPORTER_STATE_FILE", tmp.join("state.json"))
+        .env("EXPORTER_HEALTH_FILE", tmp.join("health.json"))
+        .env("HOME", &tmp)
+        .output()
+        .expect("binary should run");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let trimmed = stdout.trim();
+    assert!(
+        trimmed.starts_with('{') && trimmed.ends_with('}'),
+        "stdout must be exactly one JSON object, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("INFO") && !stdout.contains("WARN"),
+        "log records must go to stderr under --json, got: {stdout}"
+    );
+    assert!(
+        trimmed.contains("\"schema_version\":1"),
+        "the payload must be versioned so a consumer can refuse a shape it does not know"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
