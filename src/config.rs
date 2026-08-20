@@ -232,7 +232,12 @@ impl Config {
     /// re-sends otherwise-unchanged transcripts. Tags cannot contain a comma
     /// (they are split on it), so joining is unambiguous and no hash is needed.
     pub fn stamp_digest(&self) -> String {
-        self.tags.join(",")
+        // The store URL is part of the identity of "already sent". Without it,
+        // repointing the exporter at a different store leaves every session
+        // looking unchanged, so the sweep skips everything and reports success
+        // having uploaded nothing to the new store. State records what THIS
+        // store has; it says nothing about any other.
+        format!("store={}\u{1f}tags={}", self.store_url, self.tags.join(","))
     }
 }
 
@@ -766,13 +771,32 @@ mod tests {
     }
 
     #[test]
+    fn stamp_digest_changes_with_the_store() {
+        // Repointing at a different store MUST invalidate state. Without this,
+        // every session looks "already sent", the sweep skips everything, and
+        // it reports success having uploaded nothing to the new store.
+        let a = with_env(
+            &[("SESSION_STORE_URL", "http://store-a"), ("HOME", "/tmp/h")],
+            || Config::from_env().unwrap().stamp_digest(),
+        );
+        let b = with_env(
+            &[("SESSION_STORE_URL", "http://store-b"), ("HOME", "/tmp/h")],
+            || Config::from_env().unwrap().stamp_digest(),
+        );
+        assert_ne!(a, b, "state must not carry across stores");
+    }
+
+    #[test]
     fn stamp_digest_tracks_the_configured_tags() {
         with_env(
             &[("SESSION_STORE_URL", "http://s"), ("HOME", "/tmp/h")],
             || {
-                // No tags: a stable empty digest, so an untagged exporter never
-                // invalidates its own state.
-                assert_eq!(Config::from_env().unwrap().stamp_digest(), "");
+                // No tags still yields a stable digest for a given store, so an
+                // untagged exporter never invalidates its own state.
+                assert_eq!(
+                    Config::from_env().unwrap().stamp_digest(),
+                    "store=http://s\u{1f}tags="
+                );
             },
         );
         with_env(
@@ -784,7 +808,7 @@ mod tests {
             || {
                 assert_eq!(
                     Config::from_env().unwrap().stamp_digest(),
-                    "ci:run:42,team:platform"
+                    "store=http://s\u{1f}tags=ci:run:42,team:platform"
                 );
             },
         );
