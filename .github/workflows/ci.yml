@@ -8,14 +8,14 @@ on:
 permissions:
   contents: read
 
-# Must match release.yml and release-gate.yml. The portability assertion
-# iterates this list, so a name missing here is a binary that ships unchecked.
 env:
+  # Must match release.yml and release-gate.yml. The portability assertion
+  # iterates this list, so a name missing here is a binary that ships
+  # unchecked.
   BINARIES: >-
     apss-session-exporter apss-session-reconstitute
     SeshMagicSessionExporter SeshMagicSessionReconstitute
 
-env:
   # docs/REQUIREMENTS.md section 2. Not "high" - 100%, enforced here rather than
   # asserted in a document. This is a capture client whose failure mode is
   # silence: an uncaptured session produces no error, it simply never exists,
