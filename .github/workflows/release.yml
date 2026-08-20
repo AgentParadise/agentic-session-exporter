@@ -44,12 +44,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # musl, not gnu, and deliberately. A gnu build records the glibc
+          # floor of whatever runner image GitHub currently points
+          # ubuntu-latest at - that moved to 24.04 (glibc 2.39), which made
+          # the binaries unrunnable on Debian 12 (2.36) and broke the consumer
+          # smoke test below. musl links the C runtime statically, so the
+          # binaries carry no libc floor at all and run on any Linux. That
+          # matters more here than usual: these get COPY'd into other people's
+          # images, whose base distro we do not choose.
           - platform: linux-amd64
             runs-on: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - platform: linux-arm64
             runs-on: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
           - platform: darwin-arm64
             runs-on: macos-14
             target: aarch64-apple-darwin
@@ -68,6 +76,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # rusqlite is built with the `bundled` feature, so it compiles SQLite
+      # from C source and needs a musl-targeting C compiler.
+      - name: Install the musl toolchain
+        if: startsWith(matrix.platform, 'linux-')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -100,11 +114,31 @@ jobs:
       # that built it. Cross-built targets cannot run here and are skipped
       # explicitly rather than silently.
       - name: Verify the built binary answers --version
-        if: matrix.platform != 'linux-arm64' && matrix.platform != 'darwin-amd64'
+        if: matrix.platform != 'darwin-amd64'
         shell: bash
         run: |
           set -euo pipefail
-          "./dist/apss-session-exporter-${{ matrix.platform }}${{ matrix.ext }}" --version
+          for b in $BINARIES; do
+            "./dist/${b}-${{ matrix.platform }}${{ matrix.ext }}" --version
+          done
+
+      # The check that would have caught the 2.39 break at build time rather
+      # than after the image was pushed and signed. A Linux binary with a libc
+      # floor is a release blocker: it carries the runner's glibc into every
+      # image that COPYs it.
+      #
+      # One script, invoked by ci.yml, release-gate.yml and here, so the
+      # three cannot disagree about what a shippable Linux binary is. They
+      # already drifted once: the gate went on building glibc targets after
+      # the release moved to musl.
+      - name: Assert the Linux binaries are portable
+        if: startsWith(matrix.platform, 'linux-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for b in $BINARIES; do args+=("./dist/${b}-${{ matrix.platform }}"); done
+          ./scripts/assert-linux-portable.sh "${args[@]}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -213,6 +247,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      # github.ref_name is a branch name on a workflow_dispatch, and a branch
+      # name may contain "/", which is not a valid docker tag. That made a dry
+      # run dispatched from a feature branch fail on an invalid reference
+      # before it reached any of the checks it exists to run. `latest` is
+      # withheld unless this is a real tag, so a dispatch can never move it.
+      - name: Compute the image tag
+        id: imagetag
+        run: |
+          set -euo pipefail
+          t="${GITHUB_REF_NAME//\//-}"
+          echo "value=${t}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push
         id: push
         uses: docker/build-push-action@v6
@@ -221,8 +272,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ inputs.dry_run != true }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.imagetag.outputs.value }}
+            ${{ steps.imagetag.outputs.latest == 'true' && format('{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME) || '' }}
 
       - uses: sigstore/cosign-installer@v3
 
@@ -233,13 +284,14 @@ jobs:
             "${REGISTRY}/${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
 
       # Verify the way a CONSUMER actually uses this image: COPY the binary out
-      # into a glibc base and run it there.
+      # into a real base and run it there.
       #
       # The first version of this step ran the binary INSIDE the scratch image
       # and failed with `exec: no such file or directory`. That was the check
-      # being wrong, not the artifact: the binaries are dynamically linked
-      # against glibc, and a scratch image has no dynamic linker, so nothing
-      # could ever execute there. The image exists to be copied FROM, never run.
+      # being wrong, not the artifact: the image has no shell and exists to be
+      # copied FROM, never run. (The binaries were also dynamically linked at
+      # the time; they are static musl since v0.2.1, but running them in
+      # scratch would still be the wrong check.)
       #
       # A verification that does not mirror the consumer path can fail on a good
       # artifact and, worse, could pass on a bad one.
