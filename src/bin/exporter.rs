@@ -344,14 +344,6 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
         }
     }
 
-    // --json describes the shape of a SWEEP result. The other modes print
-    // prose or nothing, so accepting it there would hand a consumer an empty
-    // or unparseable stream while looking like it was honoured. Rejecting is
-    // louder than silently ignoring, and this is a usage error like any other.
-    if json && (health || dry_run || loop_secs.is_some()) {
-        return Err(ArgError::JsonUnsupportedMode);
-    }
-
     let command = if version {
         Command::Version
     } else if help {
@@ -365,6 +357,23 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
     } else {
         Command::RunOnce
     };
+
+    // --json describes the shape of a SWEEP result. The other modes print
+    // prose or nothing, so accepting it there would hand a consumer an empty
+    // or unparseable stream while looking like it was honoured.
+    //
+    // Checked AFTER the command is resolved, not before. Checking first broke
+    // the documented precedence: `--version --health --json` exited 2 instead
+    // of printing the version, which also violated the rule that --version and
+    // --help answer before anything else and never fail.
+    if json
+        && matches!(
+            command,
+            Command::Health | Command::DryRun | Command::Loop(_)
+        )
+    {
+        return Err(ArgError::JsonUnsupportedMode);
+    }
 
     Ok(Invocation {
         command,
@@ -380,7 +389,10 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
 /// changed, so nothing needed sending. `rejected`, `skipped_oversize` and
 /// `failed` all mean a session the sweep saw is NOT in the store.
 fn captured_everything(summary: &RunSummary) -> bool {
-    summary.rejected == 0 && summary.skipped_oversize == 0 && summary.failed == 0
+    summary.rejected == 0
+        && summary.skipped_oversize == 0
+        && summary.failed == 0
+        && summary.unconfirmed == 0
 }
 
 /// The `--json` payload: one object, one line, versioned.
@@ -400,7 +412,7 @@ fn render_result_json(summary: &RunSummary, cfg: &Config) -> String {
             r#"{{"schema_version":{},"scs_version":"{}","captured_everything":{},"#,
             r#""store_url":"{}","origin":{{"environment":"{}","deployment":{}}},"#,
             r#""counters":{{"discovered":{},"skipped_unchanged":{},"uploaded":{},"#,
-            r#""accepted":{},"duplicate":{},"rejected":{},"skipped_oversize":{},"failed":{}}}}}"#
+            r#""accepted":{},"duplicate":{},"rejected":{},"skipped_oversize":{},"failed":{},"unconfirmed":{}}}}}"#
         ),
         RESULT_SCHEMA_VERSION,
         escape_json(SCS_VERSION),
@@ -416,6 +428,7 @@ fn render_result_json(summary: &RunSummary, cfg: &Config) -> String {
         summary.rejected,
         summary.skipped_oversize,
         summary.failed,
+        summary.unconfirmed,
     )
 }
 
@@ -552,6 +565,7 @@ mod tests {
             rejected,
             skipped_oversize: oversize,
             failed,
+            unconfirmed: 0,
         }
     }
 
@@ -565,6 +579,29 @@ mod tests {
     fn json_does_not_change_which_command_runs() {
         assert_eq!(command(&["--json"]), Command::RunOnce);
         assert!(parse(&["--json"]).unwrap().json);
+    }
+
+    #[test]
+    fn version_and_help_still_win_over_the_json_restriction() {
+        // Checking --json before resolving the command broke the documented
+        // precedence: `--version --health --json` exited 2 instead of printing
+        // the version. --version and --help answer before anything else and
+        // must never fail.
+        assert_eq!(
+            command(&["--version", "--health", "--json"]),
+            Command::Version
+        );
+        assert_eq!(command(&["--help", "--loop", "--json"]), Command::Help);
+    }
+
+    #[test]
+    fn an_unconfirmed_envelope_is_not_captured() {
+        let mut s = summary(0, 0, 0);
+        s.unconfirmed = 1;
+        assert!(
+            !captured_everything(&s),
+            "a store that said nothing about an envelope has not stored it"
+        );
     }
 
     #[test]
@@ -618,6 +655,7 @@ mod tests {
             rejected: 0,
             skipped_oversize: 0,
             failed: 0,
+            unconfirmed: 0,
         };
         assert!(captured_everything(&s));
     }

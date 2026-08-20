@@ -3,6 +3,7 @@
 //! struct, one validation point. The write token is the only secret and is kept
 //! separate from the non-secret knobs.
 
+use sha2::{Digest, Sha256};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -237,7 +238,17 @@ impl Config {
         // looking unchanged, so the sweep skips everything and reports success
         // having uploaded nothing to the new store. State records what THIS
         // store has; it says nothing about any other.
-        format!("store={}\u{1f}tags={}", self.store_url, self.tags.join(","))
+        //
+        // HASHED, not stored verbatim. This digest is persisted in the state
+        // file, which an operator may reasonably attach to a bug report. The
+        // raw URL would disclose an internal endpoint, and any userinfo in it
+        // would be a credential. A hash compares exactly as well and discloses
+        // nothing.
+        let mut hasher = Sha256::new();
+        hasher.update(self.store_url.as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(self.tags.join(",").as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 }
 
@@ -788,30 +799,50 @@ mod tests {
 
     #[test]
     fn stamp_digest_tracks_the_configured_tags() {
-        with_env(
+        // Asserted as PROPERTIES, not literals. The digest is a hash, so a
+        // literal expectation would pin an implementation detail and tell a
+        // reader nothing about why it matters.
+        let untagged = with_env(
             &[("SESSION_STORE_URL", "http://s"), ("HOME", "/tmp/h")],
-            || {
-                // No tags still yields a stable digest for a given store, so an
-                // untagged exporter never invalidates its own state.
-                assert_eq!(
-                    Config::from_env().unwrap().stamp_digest(),
-                    "store=http://s\u{1f}tags="
-                );
-            },
+            || Config::from_env().unwrap().stamp_digest(),
         );
-        with_env(
+        let untagged_again = with_env(
+            &[("SESSION_STORE_URL", "http://s"), ("HOME", "/tmp/h")],
+            || Config::from_env().unwrap().stamp_digest(),
+        );
+        // Stable, so an untagged exporter never invalidates its own state.
+        assert_eq!(untagged, untagged_again);
+
+        let tagged = with_env(
             &[
                 ("SESSION_STORE_URL", "http://s"),
                 ("HOME", "/tmp/h"),
                 ("SESSION_STORE_TAGS", "ci:run:42, team:platform"),
             ],
-            || {
-                assert_eq!(
-                    Config::from_env().unwrap().stamp_digest(),
-                    "store=http://s\u{1f}tags=ci:run:42,team:platform"
-                );
-            },
+            || Config::from_env().unwrap().stamp_digest(),
         );
+        assert_ne!(untagged, tagged, "changing tags must invalidate state");
+    }
+
+    #[test]
+    fn stamp_digest_does_not_leak_the_store_url() {
+        // The digest is persisted in the state file, which an operator may
+        // attach to a bug report. The raw URL would disclose an internal
+        // endpoint, and userinfo in it would be a credential.
+        let digest = with_env(
+            &[
+                (
+                    "SESSION_STORE_URL",
+                    "http://user:secret@internal.example:9999",
+                ),
+                ("HOME", "/tmp/h"),
+            ],
+            || Config::from_env().unwrap().stamp_digest(),
+        );
+        assert!(!digest.contains("internal.example"));
+        assert!(!digest.contains("secret"));
+        assert!(!digest.contains("9999"));
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

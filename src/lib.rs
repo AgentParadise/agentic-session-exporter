@@ -51,6 +51,15 @@ pub struct RunSummary {
     /// connection). Logged and skipped so the sweep continues; unmarked in state
     /// so they retry next sweep.
     pub failed: usize,
+    /// Envelopes SENT for which the store returned no matching outcome: an
+    /// empty results array, a short response, or a result naming a session
+    /// that was not in the request.
+    ///
+    /// Tracked separately because it is neither an accept nor a rejection, and
+    /// counting it as neither is how a sweep that stored nothing reported
+    /// success: the items were left unmarked, so they retried, while every
+    /// failure counter stayed zero and the run looked complete.
+    pub unconfirmed: usize,
 }
 
 /// Run errors that abort the whole sweep.
@@ -241,11 +250,18 @@ async fn upload_pending<S: BatchSender + ?Sized>(
                 //
                 // Duplicate counts as confirmed: the store says it already has
                 // that session, which is the outcome the caller wanted.
-                let confirmed: std::collections::HashSet<&str> = results
-                    .iter()
-                    .filter(|r| matches!(r, Outcome::Accepted { .. } | Outcome::Duplicate { .. }))
-                    .map(|r| r.session_id())
-                    .collect();
+                // A MULTISET, not a set. Two envelopes can carry the same
+                // session id while differing in content (the dedup identity is
+                // session id plus content hash), so one Accepted result must
+                // confirm exactly ONE of them. A set would mark both, including
+                // one the store had rejected.
+                let mut confirmed: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for r in &results {
+                    if matches!(r, Outcome::Accepted { .. } | Outcome::Duplicate { .. }) {
+                        *confirmed.entry(r.session_id()).or_insert(0) += 1;
+                    }
+                }
 
                 if results.len() != slice.len() {
                     // Not fatal - the unconfirmed items simply retry next
@@ -260,8 +276,15 @@ async fn upload_pending<S: BatchSender + ?Sized>(
                 }
 
                 for (path, fp, env) in slice {
-                    if confirmed.contains(env.session_id.as_str()) {
-                        state.mark(path, fp.clone());
+                    match confirmed.get_mut(env.session_id.as_str()) {
+                        Some(remaining) if *remaining > 0 => {
+                            *remaining -= 1;
+                            state.mark(path, fp.clone());
+                        }
+                        // The store said nothing about this envelope. It stays
+                        // unmarked so the next sweep retries it, AND it is
+                        // counted, so this sweep cannot claim completeness.
+                        _ => summary.unconfirmed += 1,
                     }
                 }
             }
@@ -311,6 +334,10 @@ async fn upload_one_resilient<S: BatchSender + ?Sized>(
                     && r.session_id() == env.session_id
             }) {
                 state.mark(path, fp.to_string());
+            } else if t.rejected == 0 {
+                // Neither confirmed nor explicitly rejected: the store answered
+                // without saying anything about what was sent.
+                summary.unconfirmed += 1;
             }
         }
         Err(e) => {
@@ -606,6 +633,72 @@ mod tests {
         assert!(
             !state.is_current(&items[0].0, &items[0].1),
             "a solo-rejected session MUST be retried, not cached as sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_results_array_is_counted_as_unconfirmed() {
+        // Leaving the items unmarked was necessary but NOT sufficient: with no
+        // failure counter incremented, the sweep still reported completeness
+        // and exited 0 having stored nothing. The count is what makes the exit
+        // code honest.
+        crate::install_warn_logging();
+        let sender = ScriptedSender { results: vec![] };
+        let items = pending(&[("a", 10), ("b", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        assert_eq!(summary.unconfirmed, 2, "both envelopes went unconfirmed");
+        assert_eq!(
+            summary.rejected, 0,
+            "the store rejected nothing; it said nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_accepted_result_confirms_exactly_one_envelope() {
+        // Two envelopes can share a session id while differing in content, so
+        // a set-based match would mark BOTH on a single Accepted, including one
+        // the store never saw.
+        let sender = ScriptedSender {
+            results: vec![Outcome::Accepted {
+                session_id: "same".into(),
+            }],
+        };
+        // Distinct PATHS deliberately: two transcript files can carry the same
+        // session id with different content, which is exactly the case a
+        // set-based match gets wrong. Sharing a path would make them one state
+        // entry and the test would prove nothing.
+        let items = vec![
+            (
+                PathBuf::from("/state/same-a"),
+                "fp-a".to_string(),
+                envelope("same", 10),
+            ),
+            (
+                PathBuf::from("/state/same-b"),
+                "fp-b".to_string(),
+                envelope("same", 20),
+            ),
+        ];
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        let marked = [0usize, 1]
+            .iter()
+            .filter(|i| state.is_current(&items[**i].0, &items[**i].1))
+            .count();
+        assert_eq!(
+            marked, 1,
+            "one confirmation must confirm exactly one envelope"
+        );
+        assert_eq!(
+            summary.unconfirmed, 1,
+            "the other is unconfirmed, not silently done"
         );
     }
 
