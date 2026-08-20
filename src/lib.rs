@@ -257,9 +257,22 @@ async fn upload_pending<S: BatchSender + ?Sized>(
                 // one the store had rejected.
                 let mut confirmed: std::collections::HashMap<&str, usize> =
                     std::collections::HashMap::new();
+                // Explicit rejections are tracked separately so they are not
+                // ALSO counted as unconfirmed. "The store refused this" and
+                // "the store said nothing about this" are different facts, and
+                // a caller reading the counters should be able to tell them
+                // apart: one is a bad envelope, the other is a store not
+                // answering its contract.
+                let mut rejected_ids: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
                 for r in &results {
-                    if matches!(r, Outcome::Accepted { .. } | Outcome::Duplicate { .. }) {
-                        *confirmed.entry(r.session_id()).or_insert(0) += 1;
+                    match r {
+                        Outcome::Accepted { .. } | Outcome::Duplicate { .. } => {
+                            *confirmed.entry(r.session_id()).or_insert(0) += 1;
+                        }
+                        Outcome::Rejected { .. } => {
+                            rejected_ids.insert(r.session_id());
+                        }
                     }
                 }
 
@@ -281,10 +294,16 @@ async fn upload_pending<S: BatchSender + ?Sized>(
                             *remaining -= 1;
                             state.mark(path, fp.clone());
                         }
-                        // The store said nothing about this envelope. It stays
-                        // unmarked so the next sweep retries it, AND it is
-                        // counted, so this sweep cannot claim completeness.
-                        _ => summary.unconfirmed += 1,
+                        // Left unmarked either way, so the next sweep retries
+                        // it. Counted as unconfirmed ONLY when the store said
+                        // nothing about it; an explicit rejection is already
+                        // counted as rejected and both make the sweep
+                        // incomplete.
+                        _ => {
+                            if !rejected_ids.contains(env.session_id.as_str()) {
+                                summary.unconfirmed += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -655,6 +674,28 @@ mod tests {
             summary.rejected, 0,
             "the store rejected nothing; it said nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_rejection_is_not_also_counted_unconfirmed() {
+        // "Refused" and "not mentioned" are different facts. Counting a
+        // rejection as both inflates unconfirmed and hides which of the two
+        // actually happened, which is the thing an operator needs to know.
+        let sender = ScriptedSender {
+            results: vec![Outcome::Rejected {
+                session_id: "bad".into(),
+                reason: "schema".into(),
+            }],
+        };
+        let items = pending(&[("bad", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        assert_eq!(summary.rejected, 1);
+        assert_eq!(summary.unconfirmed, 0, "a rejection is not an unconfirmed");
+        assert!(!state.is_current(&items[0].0, &items[0].1));
     }
 
     #[tokio::test]
