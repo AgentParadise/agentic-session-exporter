@@ -147,3 +147,187 @@ fn the_write_token_never_appears_in_output() {
         "the write token must never reach stdout or stderr"
     );
 }
+
+/// A tiny store that answers health checks and rejects every envelope.
+///
+/// Needed because the interesting exit code is 3 - "the sweep RAN but did not
+/// capture everything" - and that is only reachable against a store that is UP.
+/// An unreachable store exits 1, which is a different statement.
+fn spawn_rejecting_store() -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("addr");
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming().take(8) {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            let body = if req.starts_with("POST") {
+                // A well-formed response that refuses the envelope. The session
+                // id does not need to match: an unmatched result confirms
+                // nothing, which is exactly the outcome under test.
+                r#"{"results":[{"status":"rejected","session_id":"unknown","reason":"test"}]}"#
+            } else {
+                r#"{"ok":true}"#
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// Exit 3 means "the sweep ran and did not capture everything it found".
+///
+/// The whole point of the code: a caller asking "was this session stored?"
+/// must not get a yes from a sweep that stored nothing. Asserted as EXACTLY 3,
+/// not merely non-zero, because non-zero would also pass for a sweep that
+/// never ran, which is a different answer.
+#[test]
+fn a_rejected_sweep_exits_three_and_says_so_in_json() {
+    let (url, _server) = spawn_rejecting_store();
+    let tmp = std::env::temp_dir().join("apss-cli-exit3");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("claude/p")).expect("fixture dirs");
+    std::fs::write(
+        tmp.join("claude/p/s.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\
+         \"sessionId\":\"exit3-test\",\"timestamp\":\"2026-08-19T00:00:00Z\"}\n",
+    )
+    .expect("fixture file");
+
+    let out = bin()
+        .arg("--json")
+        .env("SESSION_STORE_URL", &url)
+        .env("SESSION_STORE_ORIGIN_ENV", "container")
+        .env("CLAUDE_PROJECTS_ROOT", tmp.join("claude"))
+        .env("CODEX_SESSIONS_ROOT", tmp.join("codex"))
+        .env("EXPORTER_STATE_FILE", tmp.join("state.json"))
+        .env("EXPORTER_HEALTH_FILE", tmp.join("health.json"))
+        .env("HOME", &tmp)
+        .output()
+        .expect("binary should run");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a sweep that stored nothing must exit 3; stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        stdout.contains(r#""captured_everything":false"#),
+        "the document must agree with the exit code, got: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// --json is refused where it has no result to describe, rather than accepted
+/// and silently ignored - which would hand a consumer an empty stream that
+/// looks like a successful parse of nothing.
+#[test]
+fn json_is_refused_for_modes_with_no_sweep_result() {
+    for mode in ["--health", "--dry-run", "--loop"] {
+        let out = bin()
+            .arg("--json")
+            .arg(mode)
+            .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+            .output()
+            .expect("binary should run");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--json {mode} should be a usage error"
+        );
+    }
+}
+
+/// A sweep against an unreachable store must not look like a success.
+///
+/// This is the defect the `--json` work exists to close: before it, a caller
+/// could only ask the exit status, and a sweep that captured nothing still
+/// exited 0. Exercised through the real binary rather than the internals,
+/// because the exit code IS the interface a host-side caller uses.
+#[test]
+fn an_unreachable_store_never_exits_zero() {
+    let tmp = std::env::temp_dir().join("apss-cli-unreachable");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("claude/p")).expect("fixture dirs");
+    std::fs::write(
+        tmp.join("claude/p/s.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\
+         \"sessionId\":\"cli-test\",\"timestamp\":\"2026-08-19T00:00:00Z\"}\n",
+    )
+    .expect("fixture file");
+
+    let out = bin()
+        .arg("--json")
+        // Port 1 is not listening, so every upload fails.
+        .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+        .env("SESSION_STORE_ORIGIN_ENV", "container")
+        .env("CLAUDE_PROJECTS_ROOT", tmp.join("claude"))
+        .env("CODEX_SESSIONS_ROOT", tmp.join("codex"))
+        .env("EXPORTER_STATE_FILE", tmp.join("state.json"))
+        .env("EXPORTER_HEALTH_FILE", tmp.join("health.json"))
+        .env("HOME", &tmp)
+        .output()
+        .expect("binary should run");
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a sweep that stored nothing must not report success; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// With `--json`, stdout carries the machine result and nothing else.
+///
+/// Diagnostics default to stdout in this binary, which would interleave log
+/// lines with the document and hand a consumer a stream it cannot parse.
+#[test]
+fn json_mode_keeps_stdout_machine_readable() {
+    let tmp = std::env::temp_dir().join("apss-cli-jsonstream");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("claude")).expect("fixture dirs");
+
+    let out = bin()
+        .arg("--json")
+        .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+        .env("SESSION_STORE_ORIGIN_ENV", "container")
+        .env("CLAUDE_PROJECTS_ROOT", tmp.join("claude"))
+        .env("CODEX_SESSIONS_ROOT", tmp.join("codex"))
+        .env("EXPORTER_STATE_FILE", tmp.join("state.json"))
+        .env("EXPORTER_HEALTH_FILE", tmp.join("health.json"))
+        .env("HOME", &tmp)
+        .output()
+        .expect("binary should run");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let trimmed = stdout.trim();
+    assert!(
+        trimmed.starts_with('{') && trimmed.ends_with('}'),
+        "stdout must be exactly one JSON object, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("INFO") && !stdout.contains("WARN"),
+        "log records must go to stderr under --json, got: {stdout}"
+    );
+    assert!(
+        trimmed.contains("\"schema_version\":1"),
+        "the payload must be versioned so a consumer can refuse a shape it does not know"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
