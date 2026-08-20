@@ -64,6 +64,8 @@ enum ArgError {
     UnexpectedArgument(String),
     /// `--json` given with a mode that has no JSON result to emit.
     JsonUnsupportedMode,
+    /// `--ignore-state` given with a mode where it would mislead or do nothing.
+    IgnoreStateUnsupportedMode,
 }
 
 impl std::fmt::Display for ArgError {
@@ -75,6 +77,12 @@ impl std::fmt::Display for ArgError {
                 f,
                 "--json applies to a capture sweep only; it cannot be combined \
                  with --health, --dry-run or --loop"
+            ),
+            Self::IgnoreStateUnsupportedMode => write!(
+                f,
+                "--ignore-state applies to a capture sweep; --health reads the \
+                 health sidecar, which it does not protect, and --dry-run never \
+                 consults state at all"
             ),
         }
     }
@@ -267,7 +275,8 @@ Options:
                      contract. Applies to a capture sweep ONLY: combining it
                      with --health, --dry-run or --loop is a usage error
                      rather than a silently empty stream.
-  --ignore-state     do not READ the state file, so nothing it contains can
+  --ignore-state     do not READ or WRITE the state file, so nothing it
+                     contains can
                      influence the result. Every discovered session is sent
                      again; a conforming store deduplicates on
                      (session_id, content_hash), so the cost is a request
@@ -394,6 +403,19 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
         )
     {
         return Err(ArgError::JsonUnsupportedMode);
+    }
+
+    // --ignore-state is about a CAPTURE verdict, and pairs badly with two modes:
+    //
+    //   --health   reads the health sidecar, which the audited process can
+    //              forge under exactly the threat model this flag exists for.
+    //              Accepting it would hand back a reassuring answer from a
+    //              source the flag does not protect - a false assurance is
+    //              worse than a usage error.
+    //   --dry-run  never consults state at all, so the flag would be a silent
+    //              no-op, and a caller who believed it mattered would be wrong.
+    if ignore_state && matches!(command, Command::Health | Command::DryRun) {
+        return Err(ArgError::IgnoreStateUnsupportedMode);
     }
 
     Ok(Invocation {
@@ -716,6 +738,36 @@ mod tests {
     fn help_long_and_short_forms_parse() {
         assert_eq!(command(&["--help"]), Command::Help);
         assert_eq!(command(&["-h"]), Command::Help);
+    }
+
+    #[test]
+    fn ignore_state_is_rejected_where_it_would_mislead() {
+        // --health reads the health sidecar, which the audited process can
+        // forge under the same threat model this flag exists for; --dry-run
+        // never consults state, so the flag would be a silent no-op. Both are
+        // usage errors rather than quiet false assurance.
+        assert_eq!(
+            parse(&["--ignore-state", "--health"]),
+            Err(ArgError::IgnoreStateUnsupportedMode)
+        );
+        assert_eq!(
+            parse(&["--ignore-state", "--dry-run"]),
+            Err(ArgError::IgnoreStateUnsupportedMode)
+        );
+    }
+
+    #[test]
+    fn ignore_state_is_accepted_for_a_capture_sweep() {
+        assert!(parse(&["--ignore-state"]).unwrap().ignore_state);
+        assert!(parse(&["--ignore-state", "--json"]).unwrap().ignore_state);
+        // --loop is a repeated capture sweep, so it is meaningful there.
+        assert!(
+            parse(&["--ignore-state", "--loop", "5"])
+                .unwrap()
+                .ignore_state
+        );
+        // Absent by default: only a caller that asks pays the re-send.
+        assert!(!parse(&[]).unwrap().ignore_state);
     }
 
     #[test]

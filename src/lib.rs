@@ -1140,7 +1140,7 @@ mod tests {
             http_response(200, b"ok"),
             http_response(
                 200,
-                br#"{"results":[{"status":"accepted","session_id":"s"}]}"#,
+                br#"{"results":[{"status":"accepted","session_id":"11111111-2222-3333-4444-555555555555"}]}"#,
             ),
         ]);
         let mut cfg = test_config(&url, tmp.path());
@@ -1160,7 +1160,49 @@ mod tests {
             summary.skipped_unchanged, 0,
             "a forged state entry must not be believed"
         );
+        // Asserting `accepted == 1` alone proved less than it looked: the
+        // canned response named session "s", which is not the discovered
+        // transcript, so the run would ALSO have counted it unconfirmed. The
+        // response now names the real session id and the unconfirmed counter
+        // is asserted, so this says the transcript reached the store rather
+        // than merely that a request happened.
         assert_eq!(summary.accepted, 1, "the transcript was sent anyway");
+        assert_eq!(
+            summary.unconfirmed, 0,
+            "and the store confirmed THAT session"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignoring_state_never_rewrites_the_state_file() {
+        // An ignored state starts EMPTY. Saving it would replace a real file
+        // with only what this sweep confirmed, discarding entries for sessions
+        // that were rejected, filtered, or never reached - so a later normal
+        // run would resend all of them. A cache loss rather than a transcript
+        // loss, and conservative in direction, but a flag documented as "do
+        // not read the file" must not rewrite it either.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = spawn_server(vec![
+            http_response(200, b"ok"),
+            http_response(
+                200,
+                br#"{"results":[{"status":"accepted","session_id":"11111111-2222-3333-4444-555555555555"}]}"#,
+            ),
+        ]);
+        let mut cfg = test_config(&url, tmp.path());
+
+        // A state file with an entry this sweep will NOT confirm, which is
+        // exactly what a naive writeback would drop.
+        let mut existing = State::load(&cfg.state_file, &cfg.stamp_digest());
+        existing.mark(std::path::Path::new("/somewhere/else.jsonl"), "fp".into());
+        existing.save().unwrap();
+        let before = std::fs::read(&cfg.state_file).unwrap();
+
+        cfg.ignore_state = true;
+        run(&cfg).await.unwrap();
+
+        let after = std::fs::read(&cfg.state_file).unwrap();
+        assert_eq!(before, after, "an ignored sweep rewrote the state file");
     }
 
     #[tokio::test]
