@@ -300,7 +300,18 @@ async fn upload_one_resilient<S: BatchSender + ?Sized>(
             summary.accepted += t.accepted;
             summary.duplicate += t.duplicate;
             summary.rejected += t.rejected;
-            state.mark(path, fp.to_string());
+
+            // Same rule as the batch path, and for the same reason: a session
+            // the store REFUSED must not be recorded as sent, or the next
+            // sweep skips it as unchanged and reports success. The solo retry
+            // is where a rejected envelope most often lands, since it is the
+            // fallback for a batch that already failed.
+            if results.iter().any(|r| {
+                matches!(r, Outcome::Accepted { .. } | Outcome::Duplicate { .. })
+                    && r.session_id() == env.session_id
+            }) {
+                state.mark(path, fp.to_string());
+            }
         }
         Err(e) => {
             summary.failed += 1;
@@ -554,6 +565,47 @@ mod tests {
         assert!(
             !state.is_current(&items[1].0, &items[1].1),
             "a rejected session MUST be retried, not cached as sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_solo_retry_that_is_rejected_is_not_recorded_as_sent() {
+        // The solo path is the fallback for a batch that already failed, so a
+        // rejected envelope lands here more often than in the batch path. It
+        // had the same unconditional mark, and fixing only the batch path
+        // would have left the more likely route to silent loss open.
+        struct RejectSolo;
+
+        #[async_trait]
+        impl BatchSender for RejectSolo {
+            async fn send_batch(
+                &self,
+                batch: &[SessionEnvelope],
+            ) -> Result<Vec<Outcome>, UploadError> {
+                Ok(vec![Outcome::Rejected {
+                    session_id: batch[0].session_id.clone(),
+                    reason: "schema".into(),
+                }])
+            }
+        }
+
+        let items = pending(&[("solo", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_one_resilient(
+            &RejectSolo,
+            &items[0].0,
+            &items[0].1,
+            &items[0].2,
+            &mut state,
+            &mut summary,
+        )
+        .await;
+
+        assert!(
+            !state.is_current(&items[0].0, &items[0].1),
+            "a solo-rejected session MUST be retried, not cached as sent"
         );
     }
 
