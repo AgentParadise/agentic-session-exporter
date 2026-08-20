@@ -1203,6 +1203,15 @@ mod tests {
 
         let after = std::fs::read(&cfg.state_file).unwrap();
         assert_eq!(before, after, "an ignored sweep rewrote the state file");
+
+        // Byte equality alone could in principle hold by coincidence, so the
+        // property is also asserted semantically: the entry this sweep never
+        // confirmed is still there for the next normal run to use.
+        let reloaded = State::load(&cfg.state_file, &cfg.stamp_digest());
+        assert!(
+            reloaded.is_current(std::path::Path::new("/somewhere/else.jsonl"), "fp"),
+            "the unrelated entry a later run depends on was discarded"
+        );
     }
 
     #[tokio::test]
