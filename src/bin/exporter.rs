@@ -108,7 +108,12 @@ const EXIT_INCOMPLETE: i32 = 3;
 /// Version of the `--json` payload shape. Bump on any incompatible change, so
 /// a consumer can refuse a shape it does not understand instead of
 /// misreading it.
-const RESULT_SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 when `sessions` was added to the success document.
+///
+/// A consumer that requires session-level confirmation must check this: on
+/// schema 1 the absence of `sessions` means "this exporter cannot tell you",
+/// not "nothing was confirmed".
+const RESULT_SCHEMA_VERSION: u32 = 2;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -456,7 +461,8 @@ fn render_result_json(summary: &RunSummary, cfg: &Config) -> String {
             r#"{{"schema_version":{},"scs_version":"{}","captured_everything":{},"#,
             r#""store_url":"{}","origin":{{"environment":"{}","deployment":{}}},"#,
             r#""counters":{{"discovered":{},"skipped_unchanged":{},"uploaded":{},"#,
-            r#""accepted":{},"duplicate":{},"rejected":{},"skipped_oversize":{},"failed":{},"unconfirmed":{}}}}}"#
+            r#""accepted":{},"duplicate":{},"rejected":{},"skipped_oversize":{},"failed":{},"unconfirmed":{}}},"#,
+            r#""sessions":{}}}"#
         ),
         RESULT_SCHEMA_VERSION,
         escape_json(SCS_VERSION),
@@ -473,7 +479,28 @@ fn render_result_json(summary: &RunSummary, cfg: &Config) -> String {
         summary.skipped_oversize,
         summary.failed,
         summary.unconfirmed,
+        render_confirmed_sessions(&summary.confirmed_sessions),
     )
+}
+
+/// The confirmed session ids as a JSON array of strings.
+///
+/// Emitted so a caller can ask whether the session IT cares about reached the
+/// store, rather than only whether some number of sessions did. Counters alone
+/// let a sweep that captured an unrelated decoy report the same success as one
+/// that captured the session the caller was asking about.
+fn render_confirmed_sessions(ids: &[String]) -> String {
+    let mut out = String::from("[");
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&escape_json(id));
+        out.push('"');
+    }
+    out.push(']');
+    out
 }
 
 /// The `--json` payload for a sweep that could not run at all.
@@ -610,6 +637,7 @@ mod tests {
             skipped_oversize: oversize,
             failed,
             unconfirmed: 0,
+            confirmed_sessions: vec!["sess-a".to_string()],
         }
     }
 
@@ -700,6 +728,7 @@ mod tests {
             skipped_oversize: 0,
             failed: 0,
             unconfirmed: 0,
+            confirmed_sessions: vec!["sess-a".to_string(), "sess-b".to_string()],
         };
         assert!(captured_everything(&s));
     }
@@ -713,6 +742,38 @@ mod tests {
         assert_eq!(escape_json("a\tb"), r"a\tb");
         assert_eq!(escape_json("a\u{1}b"), r"a\u0001b");
         assert_eq!(escape_json("plain"), "plain");
+    }
+
+    #[test]
+    fn confirmed_sessions_render_as_a_json_string_array() {
+        assert_eq!(render_confirmed_sessions(&[]), "[]");
+        assert_eq!(render_confirmed_sessions(&["a".to_string()]), r#"["a"]"#);
+        assert_eq!(
+            render_confirmed_sessions(&["a".to_string(), "b".to_string()]),
+            r#"["a","b"]"#
+        );
+    }
+
+    #[test]
+    fn a_confirmed_session_id_is_escaped_like_every_other_string() {
+        // Session ids come from transcript filenames, which the audited agent
+        // controls. An unescaped quote here would let it inject arbitrary keys
+        // into the result document the host parses.
+        assert_eq!(
+            render_confirmed_sessions(&[r#"a"b"#.to_string()]),
+            r#"["a\"b"]"#
+        );
+    }
+
+    #[test]
+    fn the_same_session_id_can_be_confirmed_more_than_once() {
+        // A multiset, mirroring the confirmation logic: two envelopes can share
+        // a session id while differing in content, and each confirmation covers
+        // exactly one of them. Collapsing them would overstate what was stored.
+        assert_eq!(
+            render_confirmed_sessions(&["a".to_string(), "a".to_string()]),
+            r#"["a","a"]"#
+        );
     }
 
     #[test]
