@@ -58,6 +58,8 @@ struct Invocation {
 enum ArgError {
     UnknownFlag(String),
     UnexpectedArgument(String),
+    /// `--json` given with a mode that has no JSON result to emit.
+    JsonUnsupportedMode,
 }
 
 impl std::fmt::Display for ArgError {
@@ -65,6 +67,11 @@ impl std::fmt::Display for ArgError {
         match self {
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
             Self::UnexpectedArgument(arg) => write!(f, "unexpected argument: {arg}"),
+            Self::JsonUnsupportedMode => write!(
+                f,
+                "--json applies to a capture sweep only; it cannot be combined \
+                 with --health, --dry-run or --loop"
+            ),
         }
     }
 }
@@ -133,7 +140,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         subscriber.init();
     }
 
-    let mut cfg = Config::from_env()?;
+    // A configuration failure must still produce a document under --json, for
+    // the same reason a sweep failure does: a consumer that always parses
+    // stdout would otherwise get an empty stream, which reads as "no result"
+    // rather than "this exporter is misconfigured". The store URL is unknown
+    // here by definition, so it is reported as null rather than invented.
+    let mut cfg = match Config::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            if invocation.json {
+                println!("{}", render_config_error_json(&e.to_string()));
+            }
+            return Err(e.into());
+        }
+    };
     // A CLI --cursor-limit / --limit overrides the CURSOR_LIMIT env value.
     if let Some(n) = invocation.cursor_limit {
         cfg.cursor_limit = Some(n);
@@ -239,7 +259,9 @@ Options:
   --json             print the sweep result as one JSON object instead of a
                      prose line. This is the supported machine interface;
                      the prose line is for humans and its wording is not a
-                     contract.
+                     contract. Applies to a capture sweep ONLY: combining it
+                     with --health, --dry-run or --loop is a usage error
+                     rather than a silently empty stream.
 
 Exit codes for a capture sweep:
   0                  every session found reached the store (or was already
@@ -320,6 +342,14 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
             }
             other => return Err(ArgError::UnexpectedArgument(other.to_string())),
         }
+    }
+
+    // --json describes the shape of a SWEEP result. The other modes print
+    // prose or nothing, so accepting it there would hand a consumer an empty
+    // or unparseable stream while looking like it was honoured. Rejecting is
+    // louder than silently ignoring, and this is a usage error like any other.
+    if json && (health || dry_run || loop_secs.is_some()) {
+        return Err(ArgError::JsonUnsupportedMode);
     }
 
     let command = if version {
@@ -411,6 +441,20 @@ fn render_error_json(message: &str, cfg: &Config) -> String {
         escape_json(&cfg.store_url),
         escape_json(&cfg.origin_environment),
         deployment,
+    )
+}
+
+/// The `--json` payload for a run that could not even load its configuration.
+///
+/// Deliberately a reduced shape: store URL and origin are unknown at this
+/// point, and reporting them as empty strings would look like configured
+/// values rather than absent ones.
+fn render_config_error_json(message: &str) -> String {
+    format!(
+        r#"{{"schema_version":{},"scs_version":"{}","captured_everything":false,"error":"{}","store_url":null,"origin":null}}"#,
+        RESULT_SCHEMA_VERSION,
+        escape_json(SCS_VERSION),
+        escape_json(message),
     )
 }
 
@@ -518,13 +562,35 @@ mod tests {
     }
 
     #[test]
-    fn json_is_a_modifier_not_a_mode() {
-        // It must not change WHICH command runs, or `--json --health` would
-        // silently become a capture sweep.
+    fn json_does_not_change_which_command_runs() {
         assert_eq!(command(&["--json"]), Command::RunOnce);
-        assert_eq!(command(&["--json", "--health"]), Command::Health);
-        assert_eq!(command(&["--json", "--dry-run"]), Command::DryRun);
-        assert!(parse(&["--json", "--health"]).unwrap().json);
+        assert!(parse(&["--json"]).unwrap().json);
+    }
+
+    #[test]
+    fn json_is_refused_where_there_is_no_sweep_result() {
+        // An earlier version of this test asserted the opposite, that --json
+        // was simply carried alongside --health and --dry-run. Review pointed
+        // out what that means in practice: those modes print prose or nothing,
+        // so a consumer passing --json would get an empty or unparseable
+        // stream while believing the flag was honoured. Refusing is louder.
+        for mode in ["--health", "--dry-run", "--loop"] {
+            assert_eq!(
+                parse(&["--json", mode]),
+                Err(ArgError::JsonUnsupportedMode),
+                "--json {mode} should be a usage error"
+            );
+        }
+        // Without --json those modes are still perfectly valid.
+        assert_eq!(command(&["--health"]), Command::Health);
+        assert_eq!(command(&["--dry-run"]), Command::DryRun);
+    }
+
+    #[test]
+    fn the_json_mode_error_names_the_problem() {
+        assert!(ArgError::JsonUnsupportedMode
+            .to_string()
+            .contains("capture sweep only"));
     }
 
     #[test]

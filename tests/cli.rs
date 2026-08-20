@@ -148,6 +148,108 @@ fn the_write_token_never_appears_in_output() {
     );
 }
 
+/// A tiny store that answers health checks and rejects every envelope.
+///
+/// Needed because the interesting exit code is 3 - "the sweep RAN but did not
+/// capture everything" - and that is only reachable against a store that is UP.
+/// An unreachable store exits 1, which is a different statement.
+fn spawn_rejecting_store() -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("addr");
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming().take(8) {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            let body = if req.starts_with("POST") {
+                // A well-formed response that refuses the envelope. The session
+                // id does not need to match: an unmatched result confirms
+                // nothing, which is exactly the outcome under test.
+                r#"{"results":[{"status":"rejected","session_id":"unknown","reason":"test"}]}"#
+            } else {
+                r#"{"ok":true}"#
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// Exit 3 means "the sweep ran and did not capture everything it found".
+///
+/// The whole point of the code: a caller asking "was this session stored?"
+/// must not get a yes from a sweep that stored nothing. Asserted as EXACTLY 3,
+/// not merely non-zero, because non-zero would also pass for a sweep that
+/// never ran, which is a different answer.
+#[test]
+fn a_rejected_sweep_exits_three_and_says_so_in_json() {
+    let (url, _server) = spawn_rejecting_store();
+    let tmp = std::env::temp_dir().join("apss-cli-exit3");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("claude/p")).expect("fixture dirs");
+    std::fs::write(
+        tmp.join("claude/p/s.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\
+         \"sessionId\":\"exit3-test\",\"timestamp\":\"2026-08-19T00:00:00Z\"}\n",
+    )
+    .expect("fixture file");
+
+    let out = bin()
+        .arg("--json")
+        .env("SESSION_STORE_URL", &url)
+        .env("SESSION_STORE_ORIGIN_ENV", "container")
+        .env("CLAUDE_PROJECTS_ROOT", tmp.join("claude"))
+        .env("CODEX_SESSIONS_ROOT", tmp.join("codex"))
+        .env("EXPORTER_STATE_FILE", tmp.join("state.json"))
+        .env("EXPORTER_HEALTH_FILE", tmp.join("health.json"))
+        .env("HOME", &tmp)
+        .output()
+        .expect("binary should run");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a sweep that stored nothing must exit 3; stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        stdout.contains(r#""captured_everything":false"#),
+        "the document must agree with the exit code, got: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// --json is refused where it has no result to describe, rather than accepted
+/// and silently ignored - which would hand a consumer an empty stream that
+/// looks like a successful parse of nothing.
+#[test]
+fn json_is_refused_for_modes_with_no_sweep_result() {
+    for mode in ["--health", "--dry-run", "--loop"] {
+        let out = bin()
+            .arg("--json")
+            .arg(mode)
+            .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+            .output()
+            .expect("binary should run");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--json {mode} should be a usage error"
+        );
+    }
+}
+
 /// A sweep against an unreachable store must not look like a success.
 ///
 /// This is the defect the `--json` work exists to close: before it, a caller
