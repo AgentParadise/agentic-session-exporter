@@ -9,6 +9,13 @@ permissions:
   contents: read
 
 env:
+  # Must match release.yml and release-gate.yml. The portability assertion
+  # iterates this list, so a name missing here is a binary that ships
+  # unchecked.
+  BINARIES: >-
+    apss-session-exporter apss-session-reconstitute
+    SeshMagicSessionExporter SeshMagicSessionReconstitute
+
   # docs/REQUIREMENTS.md section 2. Not "high" - 100%, enforced here rather than
   # asserted in a document. This is a capture client whose failure mode is
   # silence: an uncaptured session produces no error, it simply never exists,
@@ -106,8 +113,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runs-on: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
-          - { runs-on: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          # musl, matching release.yml. These must stay identical: this job
+          # exists so a release platform cannot fail for the first time at tag
+          # time, which it can do again the moment the two lists diverge.
+          - { runs-on: ubuntu-latest,  target: x86_64-unknown-linux-musl }
+          - { runs-on: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { runs-on: macos-14,       target: aarch64-apple-darwin }
           - { runs-on: macos-14,       target: x86_64-apple-darwin }  # cross-compiled: macos-13 starves
           - { runs-on: windows-latest, target: x86_64-pc-windows-msvc }
@@ -116,10 +126,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # rusqlite is `bundled`, so it compiles SQLite from C source and needs a
+      # musl-targeting C compiler.
+      - name: Install the musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
       # Every release platform must build on every PR. Discovering that Windows
       # does not compile at tag time means the release is already broken.
       - run: cargo build --locked --release --target ${{ matrix.target }}
+
+      # The same portability assertion the release gate and the release run.
+      # Here it is cheapest and earliest: a PR that would produce a binary with
+      # a libc floor fails now, rather than at the gate or, as happened with
+      # v0.2.0, after an image was pushed and signed.
+      - name: Assert the Linux binaries are portable
+        if: endsWith(matrix.target, '-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for b in $BINARIES; do
+            args+=("target/${{ matrix.target }}/release/${b}")
+          done
+          ./scripts/assert-linux-portable.sh "${args[@]}"
 
   ci-success:
     name: CI Success

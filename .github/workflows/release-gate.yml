@@ -16,6 +16,13 @@ on:
 permissions:
   contents: read
 
+# Must match release.yml. The portability assertion iterates this list, so a
+# name missing here is a binary that ships unchecked.
+env:
+  BINARIES: >-
+    apss-session-exporter apss-session-reconstitute
+    SeshMagicSessionExporter SeshMagicSessionReconstitute
+
 jobs:
   version-consistency:
     name: Version is bumped and tagged consistently
@@ -52,8 +59,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runs-on: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
-          - { runs-on: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          # musl, matching ci.yml and release.yml. This list previously kept
+          # building glibc targets after the release moved to musl, so the
+          # gate protecting the release branch was validating artifacts the
+          # release does not ship.
+          - { runs-on: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { runs-on: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { runs-on: macos-14,         target: aarch64-apple-darwin }
           - { runs-on: macos-14,       target: x86_64-apple-darwin }  # cross-compiled: macos-13 starves
           - { runs-on: windows-latest,   target: x86_64-pc-windows-msvc }
@@ -62,10 +73,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # rusqlite is `bundled`, so it compiles SQLite from C source and needs a
+      # musl-targeting C compiler.
+      - name: Install the musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
       # Every platform the release promises. A platform that fails here would
       # otherwise fail at tag time, when the release is already half-cut.
       - run: cargo build --locked --release --target ${{ matrix.target }}
+
+      # The gate runs BEFORE the tag exists, which is the only place a bad
+      # artifact can be stopped without leaving a published tag behind. The
+      # same checks in release.yml can only fail a release that has already
+      # been named.
+      - name: Assert the Linux binaries are portable
+        if: endsWith(matrix.target, '-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for b in $BINARIES; do
+            args+=("target/${{ matrix.target }}/release/${b}")
+          done
+          ./scripts/assert-linux-portable.sh "${args[@]}"
 
   image-dry-run:
     name: OCI image builds
