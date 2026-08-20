@@ -127,10 +127,10 @@ jobs:
       # floor is a release blocker: it carries the runner's glibc into every
       # image that COPYs it.
       #
-      # One script, shared with ci.yml and release-gate.yml, so the three
-      # cannot disagree about what a shippable Linux binary is. They already
-      # drifted once: the gate went on building glibc targets after the
-      # release moved to musl.
+      # One script, invoked by ci.yml, release-gate.yml and here, so the
+      # three cannot disagree about what a shippable Linux binary is. They
+      # already drifted once: the gate went on building glibc targets after
+      # the release moved to musl.
       - name: Assert the Linux binaries are portable
         if: startsWith(matrix.platform, 'linux-')
         shell: bash

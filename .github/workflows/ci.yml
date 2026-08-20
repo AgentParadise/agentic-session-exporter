@@ -8,6 +8,13 @@ on:
 permissions:
   contents: read
 
+# Must match release.yml and release-gate.yml. The portability assertion
+# iterates this list, so a name missing here is a binary that ships unchecked.
+env:
+  BINARIES: >-
+    apss-session-exporter apss-session-reconstitute
+    SeshMagicSessionExporter SeshMagicSessionReconstitute
+
 env:
   # docs/REQUIREMENTS.md section 2. Not "high" - 100%, enforced here rather than
   # asserted in a document. This is a capture client whose failure mode is
@@ -128,6 +135,21 @@ jobs:
       # Every release platform must build on every PR. Discovering that Windows
       # does not compile at tag time means the release is already broken.
       - run: cargo build --locked --release --target ${{ matrix.target }}
+
+      # The same portability assertion the release gate and the release run.
+      # Here it is cheapest and earliest: a PR that would produce a binary with
+      # a libc floor fails now, rather than at the gate or, as happened with
+      # v0.2.0, after an image was pushed and signed.
+      - name: Assert the Linux binaries are portable
+        if: endsWith(matrix.target, '-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for b in $BINARIES; do
+            args+=("target/${{ matrix.target }}/release/${b}")
+          done
+          ./scripts/assert-linux-portable.sh "${args[@]}"
 
   ci-success:
     name: CI Success

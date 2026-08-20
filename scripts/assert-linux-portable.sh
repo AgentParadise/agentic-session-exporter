@@ -28,6 +28,14 @@ fi
 # which is exactly how the original break passed its smoke test.
 BASE_IMAGE="${PORTABLE_BASE_IMAGE:-debian:12-slim}"
 
+# readelf is the whole basis of the linkage check. If it is missing, every
+# check below would find no INTERP and no NEEDED and report success, which is
+# the exact fail-open behaviour this script exists to prevent.
+if ! command -v readelf > /dev/null 2>&1; then
+  echo "::error::readelf is not installed; cannot verify linkage"
+  exit 1
+fi
+
 status=0
 for bin in "$@"; do
   if [ ! -f "$bin" ]; then
@@ -41,16 +49,33 @@ for bin in "$@"; do
   # rather than `file`, whose human-readable wording varies by architecture -
   # x86_64 musl reports "static-pie linked" while aarch64 reports "statically
   # linked", and matching on prose is how a guard silently stops guarding.
-  if readelf -l "$bin" 2>/dev/null | grep -q 'INTERP'; then
+  # Capture the output and CHECK THE EXIT STATUS before searching it. With the
+  # readelf call inside `if !`, `set -e` does not fire, stderr is discarded,
+  # and a readelf that failed to run looks identical to one that found no
+  # INTERP - so the guard would pass a dynamically linked binary. An absent
+  # result and a failed lookup must not be the same thing.
+  if ! program_headers="$(readelf -lW "$bin" 2>&1)"; then
+    echo "::error::readelf could not read program headers from $bin"
+    echo "$program_headers"
+    status=1
+    continue
+  fi
+  if grep -q 'INTERP' <<< "$program_headers"; then
     echo "::error::$bin declares a program interpreter, so it is dynamically linked"
-    readelf -l "$bin" 2>/dev/null | grep -A1 'INTERP' || true
+    grep -A1 'INTERP' <<< "$program_headers" || true
     status=1
     continue
   fi
 
-  if readelf -d "$bin" 2>/dev/null | grep -q 'NEEDED'; then
+  if ! dynamic_section="$(readelf -dW "$bin" 2>&1)"; then
+    echo "::error::readelf could not read the dynamic section of $bin"
+    echo "$dynamic_section"
+    status=1
+    continue
+  fi
+  if grep -q 'NEEDED' <<< "$dynamic_section"; then
     echo "::error::$bin declares shared library dependencies"
-    readelf -d "$bin" 2>/dev/null | grep 'NEEDED' || true
+    grep 'NEEDED' <<< "$dynamic_section" || true
     status=1
     continue
   fi

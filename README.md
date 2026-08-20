@@ -185,8 +185,8 @@ Every release publishes all five, signed, with checksums:
 
 | Platform | Target | Typical use |
 | --- | --- | --- |
-| Linux x86-64 | `x86_64-unknown-linux-gnu` | workspace containers, servers |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` | ARM containers, ARM servers |
+| Linux x86-64 | `x86_64-unknown-linux-musl` | workspace containers, servers |
+| Linux ARM64 | `aarch64-unknown-linux-musl` | ARM containers, ARM servers |
 | macOS Apple Silicon | `aarch64-apple-darwin` | developer laptops |
 | macOS Intel | `x86_64-apple-darwin` | developer laptops |
 | Windows x86-64 | `x86_64-pc-windows-msvc` | developer laptops |
