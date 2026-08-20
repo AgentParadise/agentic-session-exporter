@@ -47,6 +47,11 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-std", "io-util", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Already present transitively (via the TLS stack), so declaring it direct adds
+# no new code to the tree. Used to hash the store identity into the state file
+# rather than persisting the raw URL, which would disclose an internal endpoint
+# and any credentials embedded in it.
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"

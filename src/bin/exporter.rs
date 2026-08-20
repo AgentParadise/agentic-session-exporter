@@ -27,7 +27,7 @@ use agentic_session_exporter::{
     config::Config,
     discover_all,
     health::{self, HealthStatus},
-    run,
+    run, RunSummary,
 };
 use session_capture::SCS_VERSION;
 
@@ -47,6 +47,10 @@ enum Command {
 struct Invocation {
     command: Command,
     cursor_limit: Option<usize>,
+    /// Emit the sweep result as one JSON object on stdout instead of a prose
+    /// line. A consumer that has to regex prose is coupled to wording nothing
+    /// tests; this is the supported machine interface.
+    json: bool,
 }
 
 /// A usage error. Always reported on stderr and always exit code 2.
@@ -54,6 +58,8 @@ struct Invocation {
 enum ArgError {
     UnknownFlag(String),
     UnexpectedArgument(String),
+    /// `--json` given with a mode that has no JSON result to emit.
+    JsonUnsupportedMode,
 }
 
 impl std::fmt::Display for ArgError {
@@ -61,6 +67,11 @@ impl std::fmt::Display for ArgError {
         match self {
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
             Self::UnexpectedArgument(arg) => write!(f, "unexpected argument: {arg}"),
+            Self::JsonUnsupportedMode => write!(
+                f,
+                "--json applies to a capture sweep only; it cannot be combined \
+                 with --health, --dry-run or --loop"
+            ),
         }
     }
 }
@@ -72,6 +83,20 @@ const EXIT_USAGE: i32 = 2;
 
 /// Default daemon sweep interval when `--loop` is given without a usable value.
 const DEFAULT_LOOP_SECS: u64 = 300;
+
+/// Exit code for a sweep that RAN but did not capture everything it found.
+///
+/// Distinct from both 0 and the hard-failure 1 on purpose. A caller asking
+/// "was this session stored?" must not be able to get a false yes by checking
+/// only the exit status: a completed sweep in which every upload failed is not
+/// a success, however normally the process terminated. Callers that only care
+/// whether the binary ran can still treat any non-zero as failure.
+const EXIT_INCOMPLETE: i32 = 3;
+
+/// Version of the `--json` payload shape. Bump on any incompatible change, so
+/// a consumer can refuse a shape it does not understand instead of
+/// misreading it.
+const RESULT_SCHEMA_VERSION: u32 = 1;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -102,13 +127,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // With --json, stdout carries the machine result and NOTHING else. The
+    // default subscriber writes to stdout, which would interleave log lines
+    // with the JSON document and hand a consumer a stream it cannot parse.
+    // Diagnostics still go somewhere: stderr.
+    let subscriber = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+    );
+    if invocation.json {
+        subscriber.with_writer(std::io::stderr).init();
+    } else {
+        subscriber.init();
+    }
 
-    let mut cfg = Config::from_env()?;
+    // A configuration failure must still produce a document under --json, for
+    // the same reason a sweep failure does: a consumer that always parses
+    // stdout would otherwise get an empty stream, which reads as "no result"
+    // rather than "this exporter is misconfigured". The store URL is unknown
+    // here by definition, so it is reported as null rather than invented.
+    let mut cfg = match Config::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            if invocation.json {
+                println!("{}", render_config_error_json(&e.to_string()));
+            }
+            return Err(e.into());
+        }
+    };
     // A CLI --cursor-limit / --limit overrides the CURSOR_LIMIT env value.
     if let Some(n) = invocation.cursor_limit {
         cfg.cursor_limit = Some(n);
@@ -133,21 +178,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Command::RunOnce => {
-            // A completed sweep exits 0 even with per-item skips/failures; only a
-            // hard RunError (store unreachable, source scan failure) is non-zero.
-            let summary = run(&cfg).await?;
+            // A hard failure must still produce a document under --json.
+            // Returning early would leave a consumer that always parses stdout
+            // with an empty stream, which reads as "no result" rather than
+            // "the sweep could not run" - the two are very different to
+            // anything deciding whether a session was captured.
+            let summary = match run(&cfg).await {
+                Ok(summary) => summary,
+                Err(e) => {
+                    if invocation.json {
+                        println!("{}", render_error_json(&e.to_string(), &cfg));
+                    }
+                    return Err(e.into());
+                }
+            };
             tracing::info!(?summary, "capture run complete");
-            println!(
-                "run: discovered={} skipped_unchanged={} uploaded={} accepted={} duplicate={} rejected={} skipped_oversize={} failed={}",
-                summary.discovered,
-                summary.skipped_unchanged,
-                summary.uploaded,
-                summary.accepted,
-                summary.duplicate,
-                summary.rejected,
-                summary.skipped_oversize,
-                summary.failed
-            );
+
+            if invocation.json {
+                println!("{}", render_result_json(&summary, &cfg));
+            } else {
+                println!(
+                    "run: discovered={} skipped_unchanged={} uploaded={} accepted={} duplicate={} rejected={} skipped_oversize={} failed={}",
+                    summary.discovered,
+                    summary.skipped_unchanged,
+                    summary.uploaded,
+                    summary.accepted,
+                    summary.duplicate,
+                    summary.rejected,
+                    summary.skipped_oversize,
+                    summary.failed
+                );
+            }
+
+            // A sweep that ran but did not capture everything it found is not a
+            // success, and must not look like one to a caller that checks only
+            // the exit status. Previously this returned 0 regardless, so a
+            // sweep in which every upload failed was indistinguishable from one
+            // that stored everything.
+            if !captured_everything(&summary) {
+                std::process::exit(EXIT_INCOMPLETE);
+            }
         }
         Command::Loop(secs) => {
             tracing::info!(interval_secs = secs, store = %cfg.store_url, "exporter daemon starting");
@@ -186,6 +256,22 @@ Modes (with no mode flag, runs one capture sweep and exits):
 Options:
   --cursor-limit N   cap the run to the newest N Cursor threads (alias
                      --limit N). Overrides the CURSOR_LIMIT env var.
+  --json             print the sweep result as one JSON object instead of a
+                     prose line. This is the supported machine interface;
+                     the prose line is for humans and its wording is not a
+                     contract. Applies to a capture sweep ONLY: combining it
+                     with --health, --dry-run or --loop is a usage error
+                     rather than a silently empty stream.
+
+Exit codes for a capture sweep:
+  0                  every session found reached the store (or was already
+                     there, or was unchanged).
+  {EXIT_INCOMPLETE}                  the sweep RAN but did not capture everything it
+                     found: something was rejected, oversize, or failed.
+                     Exit 0 alone therefore does not prove a given session
+                     was stored; check this code, or read --json.
+  1                  the sweep could not run (store unreachable, scan failure).
+  {EXIT_USAGE}                  usage error.
 
 Configuration comes from the environment (SESSION_STORE_URL is required for
 every mode except --version and --help). Unrecognized arguments exit {EXIT_USAGE}.",
@@ -204,6 +290,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
     let mut help = false;
     let mut health = false;
     let mut dry_run = false;
+    let mut json = false;
     let mut loop_secs: Option<u64> = None;
     let mut cursor_limit: Option<usize> = None;
 
@@ -225,6 +312,10 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
             }
             "--dry-run" => {
                 dry_run = true;
+                i += 1;
+            }
+            "--json" => {
+                json = true;
                 i += 1;
             }
             "--loop" => {
@@ -267,10 +358,138 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
         Command::RunOnce
     };
 
+    // --json describes the shape of a SWEEP result. The other modes print
+    // prose or nothing, so accepting it there would hand a consumer an empty
+    // or unparseable stream while looking like it was honoured.
+    //
+    // Checked AFTER the command is resolved, not before. Checking first broke
+    // the documented precedence: `--version --health --json` exited 2 instead
+    // of printing the version, which also violated the rule that --version and
+    // --help answer before anything else and never fail.
+    if json
+        && matches!(
+            command,
+            Command::Health | Command::DryRun | Command::Loop(_)
+        )
+    {
+        return Err(ArgError::JsonUnsupportedMode);
+    }
+
     Ok(Invocation {
         command,
         cursor_limit,
+        json,
     })
+}
+
+/// True when every session the sweep found reached the store.
+///
+/// `duplicate` counts as captured: the store already holds that session, which
+/// is the outcome the caller wanted. `skipped_unchanged` likewise - nothing
+/// changed, so nothing needed sending. `rejected`, `skipped_oversize` and
+/// `failed` all mean a session the sweep saw is NOT in the store.
+fn captured_everything(summary: &RunSummary) -> bool {
+    summary.rejected == 0
+        && summary.skipped_oversize == 0
+        && summary.failed == 0
+        && summary.unconfirmed == 0
+}
+
+/// The `--json` payload: one object, one line, versioned.
+///
+/// Hand-rolled rather than derived so the wire shape is visible here and
+/// cannot drift when `RunSummary` gains an internal field. The store URL and
+/// resolved origin are included because a consumer needs to know WHERE the
+/// sessions went, not merely that a number went up: an exporter pointed at the
+/// wrong store reports the same counters as one pointed at the right one.
+fn render_result_json(summary: &RunSummary, cfg: &Config) -> String {
+    let deployment = match cfg.origin_deployment.as_deref() {
+        Some(d) => format!("\"{}\"", escape_json(d)),
+        None => "null".to_string(),
+    };
+    format!(
+        concat!(
+            r#"{{"schema_version":{},"scs_version":"{}","captured_everything":{},"#,
+            r#""store_url":"{}","origin":{{"environment":"{}","deployment":{}}},"#,
+            r#""counters":{{"discovered":{},"skipped_unchanged":{},"uploaded":{},"#,
+            r#""accepted":{},"duplicate":{},"rejected":{},"skipped_oversize":{},"failed":{},"unconfirmed":{}}}}}"#
+        ),
+        RESULT_SCHEMA_VERSION,
+        escape_json(SCS_VERSION),
+        captured_everything(summary),
+        escape_json(&cfg.store_url),
+        escape_json(&cfg.origin_environment),
+        deployment,
+        summary.discovered,
+        summary.skipped_unchanged,
+        summary.uploaded,
+        summary.accepted,
+        summary.duplicate,
+        summary.rejected,
+        summary.skipped_oversize,
+        summary.failed,
+        summary.unconfirmed,
+    )
+}
+
+/// The `--json` payload for a sweep that could not run at all.
+///
+/// Same envelope as the success document so a consumer parses one shape, with
+/// `captured_everything` false and the counters absent rather than zeroed:
+/// zeroes would claim the sweep looked and found nothing, which is a different
+/// and much more reassuring statement than "the sweep never ran".
+fn render_error_json(message: &str, cfg: &Config) -> String {
+    let deployment = match cfg.origin_deployment.as_deref() {
+        Some(d) => format!("\"{}\"", escape_json(d)),
+        None => "null".to_string(),
+    };
+    format!(
+        concat!(
+            r#"{{"schema_version":{},"scs_version":"{}","captured_everything":false,"#,
+            r#""error":"{}","store_url":"{}","origin":{{"environment":"{}","deployment":{}}}}}"#
+        ),
+        RESULT_SCHEMA_VERSION,
+        escape_json(SCS_VERSION),
+        escape_json(message),
+        escape_json(&cfg.store_url),
+        escape_json(&cfg.origin_environment),
+        deployment,
+    )
+}
+
+/// The `--json` payload for a run that could not even load its configuration.
+///
+/// Deliberately a reduced shape: store URL and origin are unknown at this
+/// point, and reporting them as empty strings would look like configured
+/// values rather than absent ones.
+fn render_config_error_json(message: &str) -> String {
+    format!(
+        r#"{{"schema_version":{},"scs_version":"{}","captured_everything":false,"error":"{}","store_url":null,"origin":null}}"#,
+        RESULT_SCHEMA_VERSION,
+        escape_json(SCS_VERSION),
+        escape_json(message),
+    )
+}
+
+/// Escape the characters JSON forbids in a string.
+///
+/// Values here come from configuration, which is operator-controlled but not
+/// necessarily well-formed: a store URL or deployment name containing a quote
+/// would otherwise emit a document no consumer can parse.
+fn escape_json(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Look at the token after the flag at `idx`.
@@ -336,6 +555,122 @@ mod tests {
         parse(args).expect("expected a valid command line").command
     }
 
+    fn summary(rejected: usize, oversize: usize, failed: usize) -> RunSummary {
+        RunSummary {
+            discovered: 1,
+            skipped_unchanged: 0,
+            uploaded: 1,
+            accepted: 1,
+            duplicate: 0,
+            rejected,
+            skipped_oversize: oversize,
+            failed,
+            unconfirmed: 0,
+        }
+    }
+
+    #[test]
+    fn json_is_off_by_default_and_on_when_asked() {
+        assert!(!parse(&[]).unwrap().json);
+        assert!(parse(&["--json"]).unwrap().json);
+    }
+
+    #[test]
+    fn json_does_not_change_which_command_runs() {
+        assert_eq!(command(&["--json"]), Command::RunOnce);
+        assert!(parse(&["--json"]).unwrap().json);
+    }
+
+    #[test]
+    fn version_and_help_still_win_over_the_json_restriction() {
+        // Checking --json before resolving the command broke the documented
+        // precedence: `--version --health --json` exited 2 instead of printing
+        // the version. --version and --help answer before anything else and
+        // must never fail.
+        assert_eq!(
+            command(&["--version", "--health", "--json"]),
+            Command::Version
+        );
+        assert_eq!(command(&["--help", "--loop", "--json"]), Command::Help);
+    }
+
+    #[test]
+    fn an_unconfirmed_envelope_is_not_captured() {
+        let mut s = summary(0, 0, 0);
+        s.unconfirmed = 1;
+        assert!(
+            !captured_everything(&s),
+            "a store that said nothing about an envelope has not stored it"
+        );
+    }
+
+    #[test]
+    fn json_is_refused_where_there_is_no_sweep_result() {
+        // An earlier version of this test asserted the opposite, that --json
+        // was simply carried alongside --health and --dry-run. Review pointed
+        // out what that means in practice: those modes print prose or nothing,
+        // so a consumer passing --json would get an empty or unparseable
+        // stream while believing the flag was honoured. Refusing is louder.
+        for mode in ["--health", "--dry-run", "--loop"] {
+            assert_eq!(
+                parse(&["--json", mode]),
+                Err(ArgError::JsonUnsupportedMode),
+                "--json {mode} should be a usage error"
+            );
+        }
+        // Without --json those modes are still perfectly valid.
+        assert_eq!(command(&["--health"]), Command::Health);
+        assert_eq!(command(&["--dry-run"]), Command::DryRun);
+    }
+
+    #[test]
+    fn the_json_mode_error_names_the_problem() {
+        assert!(ArgError::JsonUnsupportedMode
+            .to_string()
+            .contains("capture sweep only"));
+    }
+
+    #[test]
+    fn a_clean_sweep_captured_everything() {
+        assert!(captured_everything(&summary(0, 0, 0)));
+    }
+
+    #[test]
+    fn anything_left_uncaptured_is_not_everything() {
+        // Each of these means a session the sweep SAW is not in the store.
+        assert!(!captured_everything(&summary(1, 0, 0)), "rejected");
+        assert!(!captured_everything(&summary(0, 1, 0)), "skipped_oversize");
+        assert!(!captured_everything(&summary(0, 0, 1)), "failed");
+    }
+
+    #[test]
+    fn duplicates_and_unchanged_still_count_as_captured() {
+        // The caller asked "is it in the store"; for these the answer is yes.
+        let s = RunSummary {
+            discovered: 3,
+            skipped_unchanged: 1,
+            uploaded: 1,
+            accepted: 0,
+            duplicate: 2,
+            rejected: 0,
+            skipped_oversize: 0,
+            failed: 0,
+            unconfirmed: 0,
+        };
+        assert!(captured_everything(&s));
+    }
+
+    #[test]
+    fn escapes_the_characters_json_forbids() {
+        assert_eq!(escape_json(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_json(r"a\b"), r"a\\b");
+        assert_eq!(escape_json("a\nb"), r"a\nb");
+        assert_eq!(escape_json("a\rb"), r"a\rb");
+        assert_eq!(escape_json("a\tb"), r"a\tb");
+        assert_eq!(escape_json("a\u{1}b"), r"a\u0001b");
+        assert_eq!(escape_json("plain"), "plain");
+    }
+
     #[test]
     fn no_args_is_a_single_run() {
         assert_eq!(
@@ -343,6 +678,7 @@ mod tests {
             Invocation {
                 command: Command::RunOnce,
                 cursor_limit: None,
+                json: false,
             }
         );
     }

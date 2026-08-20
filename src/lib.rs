@@ -33,7 +33,7 @@ use session_capture::{Origin, SessionEnvelope};
 use crate::config::Config;
 use crate::sources::Discovered;
 use crate::state::State;
-use crate::upload::{tally, BatchSender, Client};
+use crate::upload::{tally, BatchSender, Client, Outcome};
 
 /// Aggregate outcome of a full run.
 #[derive(Debug, Default, Clone, Copy)]
@@ -51,6 +51,15 @@ pub struct RunSummary {
     /// connection). Logged and skipped so the sweep continues; unmarked in state
     /// so they retry next sweep.
     pub failed: usize,
+    /// Envelopes SENT for which the store returned no matching outcome: an
+    /// empty results array, a short response, or a result naming a session
+    /// that was not in the request.
+    ///
+    /// Tracked separately because it is neither an accept nor a rejection, and
+    /// counting it as neither is how a sweep that stored nothing reported
+    /// success: the items were left unmarked, so they retried, while every
+    /// failure counter stayed zero and the run looked complete.
+    pub unconfirmed: usize,
 }
 
 /// Run errors that abort the whole sweep.
@@ -228,9 +237,74 @@ async fn upload_pending<S: BatchSender + ?Sized>(
                 summary.accepted += t.accepted;
                 summary.duplicate += t.duplicate;
                 summary.rejected += t.rejected;
-                // Every item the store returned a result for was processed; mark it.
-                for (path, fp, _) in slice {
-                    state.mark(path, fp.clone());
+
+                // Mark ONLY what the store confirmed it holds.
+                //
+                // This loop used to mark the whole slice, which quietly
+                // undermined every later sweep: a REJECTED envelope was
+                // recorded as sent, so the next sweep skipped it as unchanged
+                // and reported success. One transient rejection turned into
+                // permanent silent absence. The same bug covered a store that
+                // returned 200 with fewer results than items sent, or none at
+                // all, by caching everything as done without proof.
+                //
+                // Duplicate counts as confirmed: the store says it already has
+                // that session, which is the outcome the caller wanted.
+                // A MULTISET, not a set. Two envelopes can carry the same
+                // session id while differing in content (the dedup identity is
+                // session id plus content hash), so one Accepted result must
+                // confirm exactly ONE of them. A set would mark both, including
+                // one the store had rejected.
+                let mut confirmed: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                // Explicit rejections are tracked separately so they are not
+                // ALSO counted as unconfirmed. "The store refused this" and
+                // "the store said nothing about this" are different facts, and
+                // a caller reading the counters should be able to tell them
+                // apart: one is a bad envelope, the other is a store not
+                // answering its contract.
+                let mut rejected_ids: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+                for r in &results {
+                    match r {
+                        Outcome::Accepted { .. } | Outcome::Duplicate { .. } => {
+                            *confirmed.entry(r.session_id()).or_insert(0) += 1;
+                        }
+                        Outcome::Rejected { .. } => {
+                            rejected_ids.insert(r.session_id());
+                        }
+                    }
+                }
+
+                if results.len() != slice.len() {
+                    // Not fatal - the unconfirmed items simply retry next
+                    // sweep - but it means the store is not answering the
+                    // contract, which an operator should see.
+                    tracing::warn!(
+                        sent = slice.len(),
+                        returned = results.len(),
+                        "store returned a different number of results than envelopes sent; \
+                         only confirmed sessions will be marked"
+                    );
+                }
+
+                for (path, fp, env) in slice {
+                    match confirmed.get_mut(env.session_id.as_str()) {
+                        Some(remaining) if *remaining > 0 => {
+                            *remaining -= 1;
+                            state.mark(path, fp.clone());
+                        }
+                        // Left unmarked either way, so the next sweep retries
+                        // it. Counted as unconfirmed ONLY when the store said
+                        // nothing about it; an explicit rejection is already
+                        // counted as rejected and both make the sweep
+                        // incomplete.
+                        _ => {
+                            if !rejected_ids.contains(env.session_id.as_str()) {
+                                summary.unconfirmed += 1;
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -268,7 +342,22 @@ async fn upload_one_resilient<S: BatchSender + ?Sized>(
             summary.accepted += t.accepted;
             summary.duplicate += t.duplicate;
             summary.rejected += t.rejected;
-            state.mark(path, fp.to_string());
+
+            // Same rule as the batch path, and for the same reason: a session
+            // the store REFUSED must not be recorded as sent, or the next
+            // sweep skips it as unchanged and reports success. The solo retry
+            // is where a rejected envelope most often lands, since it is the
+            // fallback for a batch that already failed.
+            if results.iter().any(|r| {
+                matches!(r, Outcome::Accepted { .. } | Outcome::Duplicate { .. })
+                    && r.session_id() == env.session_id
+            }) {
+                state.mark(path, fp.to_string());
+            } else if t.rejected == 0 {
+                // Neither confirmed nor explicitly rejected: the store answered
+                // without saying anything about what was sent.
+                summary.unconfirmed += 1;
+            }
         }
         Err(e) => {
             summary.failed += 1;
@@ -474,6 +563,217 @@ mod tests {
                 session_id: env.session_id.clone(),
             }])
         }
+    }
+
+    /// A sender whose batch response is under the caller's control, so the
+    /// tests can say exactly what the store confirmed.
+    struct ScriptedSender {
+        results: Vec<Outcome>,
+    }
+
+    #[async_trait]
+    impl BatchSender for ScriptedSender {
+        async fn send_batch(
+            &self,
+            _batch: &[SessionEnvelope],
+        ) -> Result<Vec<Outcome>, UploadError> {
+            Ok(self.results.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_session_is_not_recorded_as_sent() {
+        // The bug this prevents: marking the whole slice meant a REJECTED
+        // envelope was cached as done, so the next sweep skipped it as
+        // unchanged and reported success. One transient rejection became
+        // permanent silent absence from the store.
+        let sender = ScriptedSender {
+            results: vec![
+                Outcome::Accepted {
+                    session_id: "good".into(),
+                },
+                Outcome::Rejected {
+                    session_id: "bad".into(),
+                    reason: "schema".into(),
+                },
+            ],
+        };
+        let items = pending(&[("good", 10), ("bad", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        assert!(
+            state.is_current(&items[0].0, &items[0].1),
+            "an accepted session should not be re-sent next sweep"
+        );
+        assert!(
+            !state.is_current(&items[1].0, &items[1].1),
+            "a rejected session MUST be retried, not cached as sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_solo_retry_that_is_rejected_is_not_recorded_as_sent() {
+        // The solo path is the fallback for a batch that already failed, so a
+        // rejected envelope lands here more often than in the batch path. It
+        // had the same unconditional mark, and fixing only the batch path
+        // would have left the more likely route to silent loss open.
+        struct RejectSolo;
+
+        #[async_trait]
+        impl BatchSender for RejectSolo {
+            async fn send_batch(
+                &self,
+                batch: &[SessionEnvelope],
+            ) -> Result<Vec<Outcome>, UploadError> {
+                Ok(vec![Outcome::Rejected {
+                    session_id: batch[0].session_id.clone(),
+                    reason: "schema".into(),
+                }])
+            }
+        }
+
+        let items = pending(&[("solo", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_one_resilient(
+            &RejectSolo,
+            &items[0].0,
+            &items[0].1,
+            &items[0].2,
+            &mut state,
+            &mut summary,
+        )
+        .await;
+
+        assert!(
+            !state.is_current(&items[0].0, &items[0].1),
+            "a solo-rejected session MUST be retried, not cached as sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_results_array_is_counted_as_unconfirmed() {
+        // Leaving the items unmarked was necessary but NOT sufficient: with no
+        // failure counter incremented, the sweep still reported completeness
+        // and exited 0 having stored nothing. The count is what makes the exit
+        // code honest.
+        crate::install_warn_logging();
+        let sender = ScriptedSender { results: vec![] };
+        let items = pending(&[("a", 10), ("b", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        assert_eq!(summary.unconfirmed, 2, "both envelopes went unconfirmed");
+        assert_eq!(
+            summary.rejected, 0,
+            "the store rejected nothing; it said nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_rejection_is_not_also_counted_unconfirmed() {
+        // "Refused" and "not mentioned" are different facts. Counting a
+        // rejection as both inflates unconfirmed and hides which of the two
+        // actually happened, which is the thing an operator needs to know.
+        let sender = ScriptedSender {
+            results: vec![Outcome::Rejected {
+                session_id: "bad".into(),
+                reason: "schema".into(),
+            }],
+        };
+        let items = pending(&[("bad", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        assert_eq!(summary.rejected, 1);
+        assert_eq!(summary.unconfirmed, 0, "a rejection is not an unconfirmed");
+        assert!(!state.is_current(&items[0].0, &items[0].1));
+    }
+
+    #[tokio::test]
+    async fn one_accepted_result_confirms_exactly_one_envelope() {
+        // Two envelopes can share a session id while differing in content, so
+        // a set-based match would mark BOTH on a single Accepted, including one
+        // the store never saw.
+        let sender = ScriptedSender {
+            results: vec![Outcome::Accepted {
+                session_id: "same".into(),
+            }],
+        };
+        // Distinct PATHS deliberately: two transcript files can carry the same
+        // session id with different content, which is exactly the case a
+        // set-based match gets wrong. Sharing a path would make them one state
+        // entry and the test would prove nothing.
+        let items = vec![
+            (
+                PathBuf::from("/state/same-a"),
+                "fp-a".to_string(),
+                envelope("same", 10),
+            ),
+            (
+                PathBuf::from("/state/same-b"),
+                "fp-b".to_string(),
+                envelope("same", 20),
+            ),
+        ];
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        let marked = [0usize, 1]
+            .iter()
+            .filter(|i| state.is_current(&items[**i].0, &items[**i].1))
+            .count();
+        assert_eq!(
+            marked, 1,
+            "one confirmation must confirm exactly one envelope"
+        );
+        assert_eq!(
+            summary.unconfirmed, 1,
+            "the other is unconfirmed, not silently done"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_counts_as_stored() {
+        // The store says it already holds it, which is what the caller wanted.
+        let sender = ScriptedSender {
+            results: vec![Outcome::Duplicate {
+                session_id: "dup".into(),
+            }],
+        };
+        let items = pending(&[("dup", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        assert!(state.is_current(&items[0].0, &items[0].1));
+    }
+
+    #[tokio::test]
+    async fn an_empty_results_array_confirms_nothing() {
+        // A 200 with no results used to cache every item as done, claiming
+        // storage the store never acknowledged.
+        crate::install_warn_logging();
+        let sender = ScriptedSender { results: vec![] };
+        let items = pending(&[("a", 10), ("b", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        assert!(!state.is_current(&items[0].0, &items[0].1));
+        assert!(!state.is_current(&items[1].0, &items[1].1));
     }
 
     #[tokio::test]
