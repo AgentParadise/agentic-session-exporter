@@ -150,7 +150,14 @@ pub async fn run(cfg: &Config) -> Result<RunSummary, RunError> {
     }
 
     let discovered = discover_all(cfg)?;
-    let mut state = State::load(&cfg.state_file, &cfg.stamp_digest());
+    // A caller that cannot trust the state file asks for it to be ignored
+    // rather than protected: where the file sits somewhere the audited process
+    // can write, "protect it" has no implementation.
+    let mut state = if cfg.ignore_state {
+        State::ignoring(&cfg.state_file, &cfg.stamp_digest())
+    } else {
+        State::load(&cfg.state_file, &cfg.stamp_digest())
+    };
 
     let mut summary = RunSummary {
         discovered: discovered.len(),
@@ -964,6 +971,7 @@ mod tests {
         write_claude_transcript(&claude_root);
         Config {
             origin_deployment: None,
+            ignore_state: false,
             store_url: store_url.to_string(),
             write_token: Some("tok".into()),
             origin_host: "test-host".into(),
@@ -1097,6 +1105,113 @@ mod tests {
         assert_eq!(summary.accepted, 1);
         assert_eq!(summary.failed, 0);
         assert!(cfg.health_file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_seeded_state_file_still_skips_when_state_is_trusted() {
+        // The behaviour --ignore-state exists to defeat, pinned first so the
+        // test below measures a real difference rather than a tautology.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = spawn_server(vec![http_response(200, b"ok")]);
+        let cfg = test_config(&url, tmp.path());
+
+        let discovered = discover_all(&cfg).unwrap();
+        let mut seeded = State::load(&cfg.state_file, &cfg.stamp_digest());
+        for item in &discovered {
+            seeded.mark(&item.path, item.fingerprint.clone());
+        }
+        seeded.save().unwrap();
+
+        let summary = run(&cfg).await.unwrap();
+
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.skipped_unchanged, 1);
+        assert_eq!(summary.accepted, 0, "nothing was sent to the store");
+    }
+
+    #[tokio::test]
+    async fn ignore_state_re_sends_despite_a_seeded_state_file() {
+        // THE SECURITY PROPERTY. The state file lives where the audited
+        // process can write it, so a forged entry can make a transcript that
+        // never reached the store report as a clean sweep. Protecting the file
+        // is not possible there; not reading it is.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = spawn_server(vec![
+            http_response(200, b"ok"),
+            http_response(
+                200,
+                br#"{"results":[{"status":"accepted","session_id":"11111111-2222-3333-4444-555555555555"}]}"#,
+            ),
+        ]);
+        let mut cfg = test_config(&url, tmp.path());
+
+        let discovered = discover_all(&cfg).unwrap();
+        let mut forged = State::load(&cfg.state_file, &cfg.stamp_digest());
+        for item in &discovered {
+            forged.mark(&item.path, item.fingerprint.clone());
+        }
+        forged.save().unwrap();
+
+        cfg.ignore_state = true;
+        let summary = run(&cfg).await.unwrap();
+
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(
+            summary.skipped_unchanged, 0,
+            "a forged state entry must not be believed"
+        );
+        // Asserting `accepted == 1` alone proved less than it looked: the
+        // canned response named session "s", which is not the discovered
+        // transcript, so the run would ALSO have counted it unconfirmed. The
+        // response now names the real session id and the unconfirmed counter
+        // is asserted, so this says the transcript reached the store rather
+        // than merely that a request happened.
+        assert_eq!(summary.accepted, 1, "the transcript was sent anyway");
+        assert_eq!(
+            summary.unconfirmed, 0,
+            "and the store confirmed THAT session"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignoring_state_never_rewrites_the_state_file() {
+        // An ignored state starts EMPTY. Saving it would replace a real file
+        // with only what this sweep confirmed, discarding entries for sessions
+        // that were rejected, filtered, or never reached - so a later normal
+        // run would resend all of them. A cache loss rather than a transcript
+        // loss, and conservative in direction, but a flag documented as "do
+        // not read the file" must not rewrite it either.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = spawn_server(vec![
+            http_response(200, b"ok"),
+            http_response(
+                200,
+                br#"{"results":[{"status":"accepted","session_id":"11111111-2222-3333-4444-555555555555"}]}"#,
+            ),
+        ]);
+        let mut cfg = test_config(&url, tmp.path());
+
+        // A state file with an entry this sweep will NOT confirm, which is
+        // exactly what a naive writeback would drop.
+        let mut existing = State::load(&cfg.state_file, &cfg.stamp_digest());
+        existing.mark(std::path::Path::new("/somewhere/else.jsonl"), "fp".into());
+        existing.save().unwrap();
+        let before = std::fs::read(&cfg.state_file).unwrap();
+
+        cfg.ignore_state = true;
+        run(&cfg).await.unwrap();
+
+        let after = std::fs::read(&cfg.state_file).unwrap();
+        assert_eq!(before, after, "an ignored sweep rewrote the state file");
+
+        // Byte equality alone could in principle hold by coincidence, so the
+        // property is also asserted semantically: the entry this sweep never
+        // confirmed is still there for the next normal run to use.
+        let reloaded = State::load(&cfg.state_file, &cfg.stamp_digest());
+        assert!(
+            reloaded.is_current(std::path::Path::new("/somewhere/else.jsonl"), "fp"),
+            "the unrelated entry a later run depends on was discarded"
+        );
     }
 
     #[tokio::test]
