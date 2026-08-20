@@ -617,6 +617,68 @@ fn now_epoch_secs() -> u64 {
 mod tests {
     use super::*;
 
+    /// A Config good enough to render a result document against.
+    ///
+    /// Only the fields the renderer reads matter here (store url, origin), but
+    /// the struct has no Default, so the rest are filled with inert values.
+    fn test_cfg() -> Config {
+        Config {
+            store_url: "http://store.example:8797".to_string(),
+            write_token: None,
+            origin_host: "host-a".to_string(),
+            origin_environment: "container".to_string(),
+            origin_deployment: Some("syntropic137__development".to_string()),
+            claude_root: std::path::PathBuf::from("/nonexistent/claude"),
+            codex_root: std::path::PathBuf::from("/nonexistent/codex"),
+            cursor_db: None,
+            cursor_limit: None,
+            state_file: std::path::PathBuf::from("/nonexistent/state.json"),
+            ignore_state: true,
+            health_file: std::path::PathBuf::from("/nonexistent/health.json"),
+            health_max_age_secs: 3600,
+            batch_size: 50,
+            max_envelope_bytes: 1024 * 1024,
+            tags: Vec::new(),
+        }
+    }
+
+    /// The WIRE CONTRACT, parsed as JSON rather than string-matched.
+    ///
+    /// The unit tests around `render_confirmed_sessions` call that helper
+    /// directly, so they stay green even if its output is never placed into the
+    /// document. A mutation check caught exactly that: renaming the `sessions`
+    /// key out of `render_result_json` left every test passing. This asserts on
+    /// the parsed document, which is what a consumer actually reads.
+    #[test]
+    fn the_result_document_carries_the_confirmed_sessions() {
+        let mut s = summary(0, 0, 0);
+        s.confirmed_sessions = vec!["a".to_string(), r#"b"c"#.to_string(), "a".to_string()];
+
+        let doc = render_result_json(&s, &test_cfg());
+        let v: serde_json::Value =
+            serde_json::from_str(&doc).expect("the result document must be valid JSON");
+
+        assert_eq!(v["schema_version"], 2);
+        assert_eq!(
+            v["sessions"],
+            serde_json::json!(["a", "b\"c", "a"]),
+            "the document must name every confirmed session, duplicates included"
+        );
+    }
+
+    #[test]
+    fn a_sweep_that_confirmed_nothing_still_emits_an_array() {
+        // Not null and not absent: a consumer that has to branch on presence
+        // cannot tell "confirmed nothing" from "this exporter cannot tell you",
+        // and those mean very different things during a version rollout.
+        let mut s = summary(0, 0, 0);
+        s.confirmed_sessions = Vec::new();
+
+        let doc = render_result_json(&s, &test_cfg());
+        let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
+        assert_eq!(v["sessions"], serde_json::json!([]));
+    }
+
     fn parse(args: &[&str]) -> Result<Invocation, ArgError> {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         parse_args(&owned)
