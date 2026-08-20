@@ -122,51 +122,23 @@ jobs:
             "./dist/${b}-${{ matrix.platform }}${{ matrix.ext }}" --version
           done
 
-      # The check that would have caught the 2.39 break at build time instead
-      # of at the consumer smoke test. A dynamically linked Linux binary is a
-      # release blocker: it carries the runner's glibc floor into every image
-      # that COPYs it.
-      # The check that actually reproduces the consumer environment, and the
-      # one whose absence let the glibc 2.39 break reach a published tag. The
-      # runner's own glibc is NEWER than the oldest base we support, so running
-      # a binary here proves nothing about whether it runs THERE. Debian 12 is
-      # the floor because it is what the consuming workspace image is built on.
+      # The check that would have caught the 2.39 break at build time rather
+      # than after the image was pushed and signed. A Linux binary with a libc
+      # floor is a release blocker: it carries the runner's glibc into every
+      # image that COPYs it.
       #
-      # Both linux runners are native (amd64 and arm64), so each pulls the
-      # matching debian and needs no emulation. This runs on dry runs too,
-      # unlike the image-level consumer check further down, which is why it is
-      # here rather than only in the OCI job.
-      - name: Verify the Linux binaries run on the oldest supported base
+      # One script, shared with ci.yml and release-gate.yml, so the three
+      # cannot disagree about what a shippable Linux binary is. They already
+      # drifted once: the gate went on building glibc targets after the
+      # release moved to musl.
+      - name: Assert the Linux binaries are portable
         if: startsWith(matrix.platform, 'linux-')
         shell: bash
         run: |
           set -euo pipefail
-          for b in $BINARIES; do
-            docker run --rm -v "$PWD/dist:/dist:ro" debian:12-slim \
-              "/dist/${b}-${{ matrix.platform }}" --version
-          done
-
-      - name: Assert the Linux binaries are statically linked
-        if: startsWith(matrix.platform, 'linux-')
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Two spellings, both fully static: x86_64 musl emits a
-          # position-independent "static-pie linked", aarch64 emits
-          # "statically linked". Matching an allowlist rather than negating
-          # "dynamically linked" keeps this failing closed if `file` ever
-          # words a third variant differently.
-          for b in $BINARIES; do
-            f="./dist/${b}-${{ matrix.platform }}"
-            desc=$(file -b "$f")
-            case "$desc" in
-              *"statically linked"*|*"static-pie linked"*)
-                echo "ok: $f - $desc" ;;
-              *)
-                echo "::error::$f is not statically linked: $desc"
-                exit 1 ;;
-            esac
-          done
+          args=()
+          for b in $BINARIES; do args+=("./dist/${b}-${{ matrix.platform }}"); done
+          ./scripts/assert-linux-portable.sh "${args[@]}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -312,13 +284,14 @@ jobs:
             "${REGISTRY}/${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
 
       # Verify the way a CONSUMER actually uses this image: COPY the binary out
-      # into a glibc base and run it there.
+      # into a real base and run it there.
       #
       # The first version of this step ran the binary INSIDE the scratch image
       # and failed with `exec: no such file or directory`. That was the check
-      # being wrong, not the artifact: the binaries are dynamically linked
-      # against glibc, and a scratch image has no dynamic linker, so nothing
-      # could ever execute there. The image exists to be copied FROM, never run.
+      # being wrong, not the artifact: the image has no shell and exists to be
+      # copied FROM, never run. (The binaries were also dynamically linked at
+      # the time; they are static musl since v0.2.1, but running them in
+      # scratch would still be the wrong check.)
       #
       # A verification that does not mirror the consumer path can fail on a good
       # artifact and, worse, could pass on a bad one.

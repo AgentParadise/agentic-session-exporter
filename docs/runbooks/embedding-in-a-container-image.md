@@ -23,18 +23,15 @@ reaches production images that nobody rebuilt.
 **A `FROM scratch` source image.** It exists to be copied *from*, never run, so
 it contributes no attack surface.
 
-That last point is load-bearing, not a detail. The binaries are dynamically
-linked against glibc, so **you cannot run them inside the scratch image** - there
-is no dynamic linker there, and the attempt fails with
+That last point is load-bearing, not a detail. A `scratch` image has no shell
+and no `/proc`, so `docker run` against it is not a useful way to check the
+binaries. Copy them out and run them in whatever base your image uses.
 
-```
-exec /apss-session-exporter: no such file or directory
-```
-
-which reads like a missing file and is actually a missing interpreter. Copy them
-into a base that has a libc (Debian, Ubuntu, distroless `cc`) and they run
-normally. An Alpine consumer needs a musl build, which this repo does not
-currently publish.
+Since **v0.2.1** the Linux binaries are statically linked against musl, so they
+carry no glibc floor and run on any Linux base: Debian, Ubuntu, Alpine, or
+distroless. Earlier releases were dynamically linked against glibc and required
+a base at least as new as the builder's - v0.2.0 in particular needs glibc 2.39
+and will NOT run on Debian 12. Use v0.2.1 or later.
 
 ## Verify the image before bumping the pin
 
