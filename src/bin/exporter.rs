@@ -5,6 +5,7 @@
 //!   --loop SECONDS     run forever, sweeping every SECONDS (the daemon mode).
 //!   --health           report the age of the last successful sweep and exit.
 //!   --dry-run          discover + count only; no network, no state writes.
+//!   --ignore-state     do not read the state file; re-send everything found.
 //!   --cursor-limit N   cap the run to the newest N Cursor threads (alias
 //!                      --limit N). Mainly for a fast bounded test against a
 //!                      large real Cursor DB. Overrides the CURSOR_LIMIT env.
@@ -51,6 +52,9 @@ struct Invocation {
     /// line. A consumer that has to regex prose is coupled to wording nothing
     /// tests; this is the supported machine interface.
     json: bool,
+    /// Do not READ the state file, so nothing it contains can influence the
+    /// result. For a caller auditing a process that can write it.
+    ignore_state: bool,
 }
 
 /// A usage error. Always reported on stderr and always exit code 2.
@@ -155,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     // A CLI --cursor-limit / --limit overrides the CURSOR_LIMIT env value.
+    cfg.ignore_state = invocation.ignore_state;
     if let Some(n) = invocation.cursor_limit {
         cfg.cursor_limit = Some(n);
     }
@@ -262,6 +267,15 @@ Options:
                      contract. Applies to a capture sweep ONLY: combining it
                      with --health, --dry-run or --loop is a usage error
                      rather than a silently empty stream.
+  --ignore-state     do not READ the state file, so nothing it contains can
+                     influence the result. Every discovered session is sent
+                     again; a conforming store deduplicates on
+                     (session_id, content_hash), so the cost is a request
+                     rather than a duplicate row. For a caller auditing a
+                     process that can WRITE that file - anything able to do
+                     so can otherwise make a transcript that never reached
+                     the store report as skipped_unchanged, which reads as a
+                     clean sweep.
 
 Exit codes for a capture sweep:
   0                  every session found reached the store (or was already
@@ -293,6 +307,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
     let mut health = false;
     let mut dry_run = false;
     let mut json = false;
+    let mut ignore_state = false;
     let mut loop_secs: Option<u64> = None;
     let mut cursor_limit: Option<usize> = None;
 
@@ -318,6 +333,10 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
             }
             "--json" => {
                 json = true;
+                i += 1;
+            }
+            "--ignore-state" => {
+                ignore_state = true;
                 i += 1;
             }
             "--loop" => {
@@ -381,6 +400,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
         command,
         cursor_limit,
         json,
+        ignore_state,
     })
 }
 
@@ -678,6 +698,7 @@ mod tests {
         assert_eq!(
             parse(&[]).unwrap(),
             Invocation {
+                ignore_state: false,
                 command: Command::RunOnce,
                 cursor_limit: None,
                 json: false,

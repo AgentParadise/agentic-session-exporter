@@ -48,6 +48,26 @@ impl State {
         }
     }
 
+    /// Load NOTHING, so every discovered session is re-sent.
+    ///
+    /// For a caller that must not let the state file influence the verdict.
+    /// The file records which transcripts this exporter believes it already
+    /// sent, and `skipped_unchanged` is derived from it - so anything able to
+    /// write it can make a transcript that never reached the store read as a
+    /// clean sweep. Where the file lives in a directory the audited process
+    /// can write, protecting it is not possible; not consulting it is.
+    ///
+    /// Re-sending costs a request. A conforming store deduplicates on
+    /// (session_id, content_hash), so it is a no-op there, and a verdict that
+    /// cannot be forged is worth more than the bytes.
+    pub fn ignoring(path: &Path, config_digest: &str) -> Self {
+        Self {
+            seen: HashMap::new(),
+            path: path.to_path_buf(),
+            config_digest: config_digest.to_string(),
+        }
+    }
+
     /// True when `path` already has this exact fingerprint recorded.
     pub fn is_current(&self, path: &Path, fingerprint: &str) -> bool {
         self.seen

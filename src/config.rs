@@ -44,6 +44,11 @@ pub struct Config {
     /// State file recording the last-seen fingerprint per transcript so re-runs
     /// skip unchanged files without a network round trip.
     pub state_file: PathBuf,
+
+    /// When true, the state file is not READ, so nothing it contains can
+    /// influence the result. Set by `--ignore-state` for callers that must not
+    /// let a writable state file forge `skipped_unchanged` into a clean sweep.
+    pub ignore_state: bool,
     /// Sidecar file containing the Unix timestamp of the last completed sweep.
     /// It deliberately does not share the fingerprint-state JSON schema, so a
     /// successful sweep with no changes still has a fresh health record.
@@ -218,6 +223,8 @@ impl Config {
             cursor_db,
             cursor_limit,
             state_file,
+            // Default OFF: only a caller that explicitly asks pays the re-send.
+            ignore_state: false,
             health_file,
             health_max_age_secs,
             batch_size,
