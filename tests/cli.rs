@@ -331,3 +331,25 @@ fn json_mode_keeps_stdout_machine_readable() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn ignore_state_rejects_the_modes_it_cannot_protect() {
+    // Exit 2 is the usage contract. --health reads the health sidecar, which
+    // the audited process can forge under exactly the threat model this flag
+    // exists for, and --dry-run never consults state so the flag would be a
+    // silent no-op. Both refuse rather than hand back a reassuring answer.
+    for mode in ["--health", "--dry-run"] {
+        let out = bin()
+            .arg("--ignore-state")
+            .arg(mode)
+            .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+            .output()
+            .expect("binary should run");
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--ignore-state {mode} must be a usage error"
+        );
+    }
+}
