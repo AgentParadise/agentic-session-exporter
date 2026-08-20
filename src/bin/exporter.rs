@@ -267,7 +267,9 @@ Exit codes for a capture sweep:
   0                  every session found reached the store (or was already
                      there, or was unchanged).
   {EXIT_INCOMPLETE}                  the sweep RAN but did not capture everything it
-                     found: something was rejected, oversize, or failed.
+                     found: something was rejected, oversize, unconfirmed
+                     (sent, but the store returned no matching outcome), or
+                     failed.
                      Exit 0 alone therefore does not prove a given session
                      was stored; check this code, or read --json.
   1                  the sweep could not run (store unreachable, scan failure).
