@@ -325,7 +325,7 @@ fn json_mode_keeps_stdout_machine_readable() {
         "log records must go to stderr under --json, got: {stdout}"
     );
     assert!(
-        trimmed.contains("\"schema_version\":1"),
+        trimmed.contains("\"schema_version\":2"),
         "the payload must be versioned so a consumer can refuse a shape it does not know"
     );
 

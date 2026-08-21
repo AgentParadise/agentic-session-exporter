@@ -36,7 +36,7 @@ use crate::state::State;
 use crate::upload::{tally, BatchSender, Client, Outcome};
 
 /// Aggregate outcome of a full run.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct RunSummary {
     pub discovered: usize,
     pub skipped_unchanged: usize,
@@ -60,6 +60,37 @@ pub struct RunSummary {
     /// success: the items were left unmarked, so they retried, while every
     /// failure counter stayed zero and the run looked complete.
     pub unconfirmed: usize,
+    /// Session ids the STORE confirmed it holds during this sweep, in the order
+    /// they were confirmed.
+    ///
+    /// Populated at exactly the points where an envelope is marked in state, so
+    /// membership here means the same thing marking does: the store answered
+    /// `Accepted` or `Duplicate` for that specific envelope.
+    ///
+    /// Deliberately NOT including `skipped_unchanged`. Those were never sent
+    /// this sweep, so the store said nothing about them - only local state
+    /// claims they are held. A caller asking "is MY session in the store" needs
+    /// an answer backed by the store, not by a file the audited agent can write.
+    ///
+    /// A MULTISET, like the confirmation logic it mirrors: two envelopes can
+    /// share a session id while differing in content, and each confirmation
+    /// covers exactly one of them.
+    ///
+    /// LIMIT, and it is a sharp one: this is an ACKNOWLEDGEMENT LIST, not a
+    /// proof of authenticity. The session id is derived from the transcript
+    /// itself - for Claude it is literally the filename stem (`sources.rs`),
+    /// for Codex the payload id with a filename fallback - and the spool is
+    /// agent-writable. An agent that knows the id being looked for can delete
+    /// the real transcript and write a well-formed decoy carrying that same id;
+    /// the exporter will upload it and honestly report the id here.
+    ///
+    /// So a consumer may use membership to detect a session that never reached
+    /// the store. It may NOT use membership to conclude that the bytes the
+    /// store holds are the ones the agent actually produced. Closing that
+    /// requires an identity the agent cannot substitute - transcript bytes
+    /// hashed from a location it cannot write - which is not something this
+    /// exporter can establish on its own.
+    pub confirmed_sessions: Vec<String>,
 }
 
 /// Run errors that abort the whole sweep.
@@ -270,15 +301,20 @@ async fn upload_pending<S: BatchSender + ?Sized>(
                 // a caller reading the counters should be able to tell them
                 // apart: one is a bad envelope, the other is a store not
                 // answering its contract.
-                let mut rejected_ids: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
+                // A COUNTED multiset, for the same reason `confirmed` is one.
+                // As a set, a single rejection covering two envelopes that
+                // share a session id suppressed `unconfirmed` for BOTH: one was
+                // genuinely refused, the other got no answer at all, and the
+                // sweep under-reported the loss it had just taken.
+                let mut rejected_ids: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
                 for r in &results {
                     match r {
                         Outcome::Accepted { .. } | Outcome::Duplicate { .. } => {
                             *confirmed.entry(r.session_id()).or_insert(0) += 1;
                         }
                         Outcome::Rejected { .. } => {
-                            rejected_ids.insert(r.session_id());
+                            *rejected_ids.entry(r.session_id()).or_insert(0) += 1;
                         }
                     }
                 }
@@ -300,17 +336,20 @@ async fn upload_pending<S: BatchSender + ?Sized>(
                         Some(remaining) if *remaining > 0 => {
                             *remaining -= 1;
                             state.mark(path, fp.clone());
+                            summary.confirmed_sessions.push(env.session_id.clone());
                         }
                         // Left unmarked either way, so the next sweep retries
                         // it. Counted as unconfirmed ONLY when the store said
                         // nothing about it; an explicit rejection is already
                         // counted as rejected and both make the sweep
                         // incomplete.
-                        _ => {
-                            if !rejected_ids.contains(env.session_id.as_str()) {
-                                summary.unconfirmed += 1;
-                            }
-                        }
+                        _ => match rejected_ids.get_mut(env.session_id.as_str()) {
+                            // Consume one rejection per envelope, so a second
+                            // envelope sharing the id is still counted as
+                            // unconfirmed unless the store refused it too.
+                            Some(remaining) if *remaining > 0 => *remaining -= 1,
+                            _ => summary.unconfirmed += 1,
+                        },
                     }
                 }
             }
@@ -360,6 +399,7 @@ async fn upload_one_resilient<S: BatchSender + ?Sized>(
                     && r.session_id() == env.session_id
             }) {
                 state.mark(path, fp.to_string());
+                summary.confirmed_sessions.push(env.session_id.clone());
             } else if t.rejected == 0 {
                 // Neither confirmed nor explicitly rejected: the store answered
                 // without saying anything about what was sent.
@@ -814,6 +854,134 @@ mod tests {
         assert!(state.is_current(&PathBuf::from("/state/a"), "fp-a"));
         assert!(state.is_current(&PathBuf::from("/state/c"), "fp-c"));
         assert!(!state.is_current(&PathBuf::from("/state/big"), "fp-big"));
+    }
+
+    #[tokio::test]
+    async fn confirmed_sessions_names_exactly_what_the_store_confirmed() {
+        // The security property behind this field: a caller must be able to ask
+        // "is MY session in the store", not merely "did some number of sessions
+        // land". Counters alone let a sweep that captured an unrelated decoy
+        // report the same success as one that captured the session asked about.
+        let sender = MockSender::new(&["big"]);
+        let items = pending(&[("a", 10), ("big", 10), ("c", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        // "big" failed its solo retry, so it is absent - being discovered and
+        // attempted is not the same as being held by the store.
+        assert_eq!(
+            summary.confirmed_sessions,
+            vec!["a".to_string(), "c".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whole_batch_that_succeeds_confirms_every_session_in_it() {
+        // The batch path, not the solo-retry path. MockSender rejects any batch
+        // larger than one item, so every other test here reaches confirmation
+        // through solo retries and leaves the batch path unexercised - a gap a
+        // mutation check found by deleting the batch-path confirmation without
+        // breaking a single test.
+        struct AcceptBatch;
+
+        #[async_trait]
+        impl BatchSender for AcceptBatch {
+            async fn send_batch(
+                &self,
+                batch: &[SessionEnvelope],
+            ) -> Result<Vec<Outcome>, UploadError> {
+                Ok(batch
+                    .iter()
+                    .map(|e| Outcome::Accepted {
+                        session_id: e.session_id.clone(),
+                    })
+                    .collect())
+            }
+        }
+
+        let items = pending(&[("a", 10), ("b", 10), ("c", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&AcceptBatch, 50, &items, &mut state, &mut summary).await;
+
+        assert_eq!(summary.accepted, 3);
+        assert_eq!(
+            summary.confirmed_sessions,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_rejection_does_not_excuse_a_second_envelope_with_the_same_id() {
+        // Two envelopes share a session id; the store refuses ONE and says
+        // nothing about the other. Before rejected_ids became a counted
+        // multiset, the single rejection suppressed `unconfirmed` for both, so
+        // the sweep under-reported a session it had just failed to store.
+        struct RejectOnce;
+
+        #[async_trait]
+        impl BatchSender for RejectOnce {
+            async fn send_batch(
+                &self,
+                batch: &[SessionEnvelope],
+            ) -> Result<Vec<Outcome>, UploadError> {
+                // One result for a two-envelope batch: a refusal for the id,
+                // and silence about the other envelope carrying it.
+                Ok(vec![Outcome::Rejected {
+                    session_id: batch[0].session_id.clone(),
+                    reason: "schema".into(),
+                }])
+            }
+        }
+
+        let items = pending(&[("dup", 10), ("dup", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&RejectOnce, 50, &items, &mut state, &mut summary).await;
+
+        assert_eq!(summary.rejected, 1, "the store refused exactly one");
+        assert_eq!(
+            summary.unconfirmed, 1,
+            "the envelope the store said nothing about must still count as unconfirmed"
+        );
+        assert!(summary.confirmed_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_session_is_never_confirmed() {
+        // A rejection is the store saying "I refused this". Recording it as
+        // confirmed would be the same class of bug as marking it in state:
+        // the caller stops asking about a session nobody has.
+        struct RejectEverything;
+
+        #[async_trait]
+        impl BatchSender for RejectEverything {
+            async fn send_batch(
+                &self,
+                batch: &[SessionEnvelope],
+            ) -> Result<Vec<Outcome>, UploadError> {
+                Ok(vec![Outcome::Rejected {
+                    session_id: batch[0].session_id.clone(),
+                    reason: "schema".into(),
+                }])
+            }
+        }
+
+        let items = pending(&[("solo", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&RejectEverything, 50, &items, &mut state, &mut summary).await;
+
+        assert_eq!(summary.rejected, 1);
+        assert!(
+            summary.confirmed_sessions.is_empty(),
+            "a refused session must not appear as confirmed"
+        );
     }
 
     #[tokio::test]
