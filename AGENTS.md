@@ -62,30 +62,63 @@ CLI, the abstraction is wrong and the abstraction is what to fix. Every harness
 carries its own fixtures and round-trip test, because a parser without a real
 transcript behind it is an assumption.
 
-## Branching
+## Branching and releasing
 
-`main` is development. `release` publishes.
+`main` is the only long-lived branch. **Publishing is a tag on `main`.**
 
-`release` is protected, and the protection is the point: a gate that a direct
-push can bypass is not a gate, it is a suggestion. Enforced on the branch:
+```
+PR -> main -> tag v<version> -> release.yml publishes
+```
 
-- a pull request is required, so nothing lands by push
-- **Release Gate Success** must pass, with `strict` on so the branch must be up
-  to date with its base first (a gate that passed against stale code proves
-  nothing about what actually merges)
-- force pushes and deletion are blocked, so published history cannot be rewritten
-  underneath a consumer who pinned a digest from it
-- conversation resolution is required, so a raised concern cannot be merged past
-  in silence
+`release.yml` triggers on `push: tags: ["v*"]`. Every release so far was tagged
+on a `main` commit; `v0.4.0` is `9e31764`, which is contained in `origin/main`
+and in no other branch.
 
-The gate itself is deliberately stricter than CI rather than a rerun of it:
-version bumped and untagged, lockfile in sync, all five platforms building in
-release mode, OCI image building multi-arch. Tagging `v*` then publishes
-binaries, one checksum manifest, one signature over it, and the signed OCI image.
+**There is no `release` branch.** An earlier revision of this file described one
+("`main` is development, `release` publishes") along with a protected-branch
+promotion and its enforcement rules. None of it exists: `git ls-remote --heads
+origin` lists no `release`, and nothing has ever been promoted to it. That
+description cost real time, because someone reading it stops and waits for a
+gated promotion step that has no branch to promote to. Documentation that
+invents a safeguard is worse than documentation that admits there is none, since
+the reader trusts it and plans around it.
 
-Approvals are set to zero on purpose for now, since this is a single-maintainer
-repo and requiring a second approver would only teach people to bypass the
-protection. Raise it when there is a second maintainer, not before.
+If a `release` branch is ever wanted, add it and restore that section then, not
+before.
+
+### Release Gate Success
+
+The gate runs on pull requests and checks more than CI does: the version is
+bumped and untagged, the lockfile is in sync, and all five platforms build in
+release mode.
+
+It also claims to verify that the OCI image builds multi-arch. **It does not.**
+`image-dry-run` builds an unrelated scratch image containing only `.keep`; the
+real OCI context is assembled in `release.yml`, after the tag. See issue #22.
+
+Until that is fixed, validate the real image path before tagging by running
+`release.yml` manually with `dry_run: true`, which builds and verifies the
+actual release artifacts without publishing. Then, after publishing, verify the
+image by immutable digest rather than by tag:
+
+```bash
+# both platforms present
+docker manifest inspect ghcr.io/agentparadise/agentic-session-exporter:v<version>
+
+# binaries present, mode 0755, and correct per architecture
+#   COPY --from=<image>@sha256:<index-digest> into a normal Linux image,
+#   then ls -l and run --version under --platform linux/amd64 and linux/arm64.
+#   The two binaries should differ in SIZE - identical sizes mean one
+#   architecture got a copy of the other.
+
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/AgentParadise/agentic-session-exporter/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/agentparadise/agentic-session-exporter@sha256:<index-digest>
+```
+
+Tagging `v*` publishes the per-platform binaries, one checksum manifest, one
+signature over it, and the signed OCI image.
 
 ## Before opening a PR
 
