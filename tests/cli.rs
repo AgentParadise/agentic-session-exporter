@@ -353,3 +353,263 @@ fn ignore_state_rejects_the_modes_it_cannot_protect() {
         );
     }
 }
+
+fn local_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("claude")).unwrap();
+    std::fs::write(
+        tmp.path().join("claude/native.jsonl"),
+        "{\"type\":\"user\",\"sessionId\":\"native\",\"timestamp\":\"2026-07-01T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"local capture\"}}\r\n",
+    ).unwrap();
+    tmp
+}
+
+fn local_bin(root: &std::path::Path) -> Command {
+    let mut command = bin();
+    command
+        .env_clear()
+        .env("HOME", root)
+        .env("CLAUDE_PROJECTS_ROOT", root.join("claude"))
+        .env("CODEX_SESSIONS_ROOT", root.join("codex-empty"))
+        .env("SESSION_STORE_ORIGIN_HOST", "local-test")
+        .env("SESSION_STORE_ORIGIN_ENV", "local")
+        .env("EXPORTER_SPOOL_DIR", root.join("durable-spool"));
+    // Keep instrumentation output while excluding user capture configuration.
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    command
+}
+
+#[test]
+fn local_capture_requires_no_store_and_reads_after_original_transcript_is_removed() {
+    let tmp = local_fixture();
+    let first = local_bin(tmp.path())
+        .args(["--spool-only", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(summary["stored"], 1);
+    assert!(summary.get("captured_everything").is_none());
+    let repeated = local_bin(tmp.path()).arg("--spool-only").output().unwrap();
+    assert!(repeated.status.success());
+    let summary: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(summary["duplicate"], 1);
+    let listed = local_bin(tmp.path())
+        .args(["--spool-list", "0"])
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let page: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+    let sequence = page["entries"][0]["sequence"].as_u64().unwrap().to_string();
+    let original = std::fs::read_to_string(tmp.path().join("claude/native.jsonl")).unwrap();
+    std::fs::remove_dir_all(tmp.path().join("claude")).unwrap();
+    let body = local_bin(tmp.path())
+        .args(["--spool-read", &sequence])
+        .output()
+        .unwrap();
+    assert!(body.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&body.stdout).unwrap();
+    assert_eq!(envelope["session_id"], "native");
+    assert_eq!(envelope["raw"], original);
+    assert!(envelope.get("content_hash").is_none());
+}
+
+#[test]
+fn local_spool_modes_reject_ambiguous_or_malformed_arguments() {
+    for arguments in [
+        vec!["--spool-only", "--loop"],
+        vec!["--spool-only", "--health"],
+        vec!["--spool-only", "--ignore-state"],
+        vec!["--spool-only", "--dry-run"],
+        vec!["--spool-only", "--cursor-limit", "2"],
+        vec!["--spool-only", "--spool-read", "1"],
+        vec!["--spool-read", "0"],
+        vec!["--spool-read", "oops"],
+        vec!["--spool-read"],
+        vec!["--spool-list", "1:"],
+        vec!["--spool-list", "x:2"],
+        vec!["--spool-only", "--spool-only"],
+    ] {
+        let out = bin().args(arguments).output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+    }
+}
+
+#[test]
+fn local_spool_needs_explicit_absolute_storage_and_reports_oversize_failure() {
+    let tmp = local_fixture();
+    for directory in [None, Some("relative-spool")] {
+        let mut command = local_bin(tmp.path());
+        command.arg("--spool-only").env_remove("EXPORTER_SPOOL_DIR");
+        if let Some(value) = directory {
+            command.env("EXPORTER_SPOOL_DIR", value);
+        }
+        assert!(!command.output().unwrap().status.success());
+    }
+    let out = local_bin(tmp.path())
+        .arg("--spool-only")
+        .env("MAX_ENVELOPE_BYTES", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(summary["stored"], 0);
+    assert_eq!(summary["skipped_oversize"], 1);
+}
+
+#[test]
+fn inventory_enqueue_is_durable_and_rejects_conflicts_without_network() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let root = tempfile::tempdir().unwrap();
+    let body = serde_json::json!({"operation":"publish", "body": {
+        "run":{"source_instance_id":"source","execution_id":"run"},
+        "revision_id":"r1", "parent_revision_id":null, "revision_sequence":1,
+        "producer_id":"producer", "sequence_high_watermark":0,
+        "resolver_version":"v1", "coverage":"unknown", "expected_record_count":0
+    }});
+    let send = |value: &serde_json::Value| {
+        let mut child = bin()
+            .arg("--inventory-enqueue")
+            .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+            .env("INVENTORY_WRITE_TOKEN", "never-print-this-secret")
+            .env("EXPORTER_INVENTORY_DIR", root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(value.to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let first = send(&body);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&first.stdout).unwrap()["inserted"],
+        true
+    );
+    let retry = send(&body);
+    assert!(retry.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&retry.stdout).unwrap()["inserted"],
+        false
+    );
+    let mut changed = body;
+    changed["body"]["coverage"] = "missing".into();
+    let conflict = send(&changed);
+    assert!(!conflict.status.success());
+    assert!(!String::from_utf8_lossy(&conflict.stderr).contains("never-print-this-secret"));
+    let drain = bin()
+        .args(["--inventory-drain", "1"])
+        .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+        .env("INVENTORY_WRITE_TOKEN", "never-print-this-secret")
+        .env("EXPORTER_INVENTORY_DIR", root.path())
+        .output()
+        .unwrap();
+    assert_eq!(drain.status.code(), Some(3));
+    let result: serde_json::Value = serde_json::from_slice(&drain.stdout).unwrap();
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["remaining"], 1);
+}
+
+#[test]
+fn inventory_modes_reject_invalid_bounds_and_capture_flags() {
+    for args in [
+        vec!["--inventory-drain", "0"],
+        vec!["--inventory-drain", "501"],
+        vec!["--inventory-enqueue", "--spool-only"],
+        vec!["--inventory-enqueue", "--ignore-state"],
+    ] {
+        assert_eq!(bin().args(args).output().unwrap().status.code(), Some(2));
+    }
+}
+
+#[test]
+fn capture_delivery_cli_restarts_without_losing_pending_envelopes() {
+    use std::{io::Write, process::Stdio};
+    let root = tempfile::tempdir().unwrap();
+    let input=serde_json::json!({"identity":{"source_instance_id":"source","harness":"codex","native_session_id":"native"},
+        "envelope":{"scs_version":"1.0","origin":{"host":"test","environment":"local"},"agent":"codex",
+        "source_format":"codex-rollout-jsonl","session_id":"native","started_at":"2026-09-22T00:00:00Z",
+        "last_activity_at":"2026-09-22T00:00:01Z","raw":"exact\r\n"}}).to_string();
+    let configured = || {
+        let mut command = bin();
+        command
+            .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+            .env("CAPTURE_WRITE_TOKEN", "never-print-this-secret")
+            .env("EXPORTER_CAPTURE_DIR", root.path());
+        command
+    };
+    let send = |mode: &str, input: &str| {
+        let mut child = configured()
+            .arg(mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    for inserted in [true, false] {
+        let result = send("--capture-enqueue", &input);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(receipt["schema_version"], 1);
+        assert_eq!(receipt["inserted"], inserted);
+    }
+    let pending = send("--capture-receipt", &input);
+    assert!(pending.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&pending.stdout).unwrap(),
+        serde_json::json!({"schema_version":1,"receipt":null})
+    );
+    let invalid = send("--capture-enqueue", "{\"identity\":{},\"identity\":{}}");
+    assert!(!invalid.status.success());
+    assert!(!String::from_utf8_lossy(&invalid.stderr).contains("never-print-this-secret"));
+    let result = configured()
+        .args(["--capture-drain", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(3));
+    let result: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["remaining"], 1);
+    for args in [
+        vec!["--capture-receipt", "--json"],
+        vec!["--capture-receipt", "--capture-enqueue"],
+        vec!["--capture-drain", "0"],
+        vec!["--capture-drain", "51"],
+        vec!["--capture-enqueue", "--inventory-enqueue"],
+        vec!["--capture-enqueue", "--json"],
+        vec!["--capture-enqueue", "--ignore-state"],
+    ] {
+        assert_eq!(bin().args(args).output().unwrap().status.code(), Some(2));
+    }
+}

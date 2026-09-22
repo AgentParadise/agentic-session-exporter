@@ -26,7 +26,7 @@ pub enum ParseError {
     Empty,
     #[error("could not determine session id from transcript")]
     NoSessionId,
-    #[error("Claude JSONL transcript is not valid UTF-8, so it cannot be preserved as an SCS raw string")]
+    #[error("JSONL transcript is not valid UTF-8, so it cannot be preserved as an SCS raw string")]
     InvalidUtf8,
 }
 
@@ -145,7 +145,8 @@ pub fn read_codex(
     fallback_id: &str,
     origin: Origin,
 ) -> Result<SessionEnvelope, ParseError> {
-    let rows = parse_rows(bytes);
+    let raw = String::from_utf8(bytes.to_vec()).map_err(|_| ParseError::InvalidUtf8)?;
+    let rows = parse_rows(raw.as_bytes());
     if rows.is_empty() {
         return Err(ParseError::Empty);
     }
@@ -207,7 +208,7 @@ pub fn read_codex(
         last_activity_at,
         content_hash: None,
         metadata: Some(meta),
-        raw: Value::Array(rows),
+        raw: Value::String(raw),
     })
 }
 
@@ -389,7 +390,7 @@ mod tests {
         assert_eq!(metadata.cwd.as_deref(), Some("/c"));
         assert_eq!(metadata.model.as_deref(), Some("openai"));
         assert_eq!(metadata.message_count, Some(1));
-        assert_eq!(env.raw.as_array().unwrap().len(), 2);
+        assert_eq!(env.raw.as_str(), Some(jsonl));
     }
 
     #[test]
@@ -413,6 +414,17 @@ mod tests {
         let jsonl = r#"{"type":"user","message":{"role":"user","content":"hi"}}"#;
         let err = read_claude(jsonl.as_bytes(), "   ", origin()).unwrap_err();
         assert_eq!(parse_err_kind(&err), "no-session-id");
+    }
+
+    #[test]
+    fn codex_preserves_original_bytes_and_rejects_invalid_utf8() {
+        let raw = b"{ \"type\": \"session_meta\", \"payload\": {\"id\":\"native\"} }\r\nmalformed line\r\n\r\n";
+        let envelope = read_codex(raw, "fallback", origin()).unwrap();
+        assert_eq!(envelope.raw.as_str().unwrap().as_bytes(), raw);
+        assert!(matches!(
+            read_codex(b"\xff", "fallback", origin()),
+            Err(ParseError::InvalidUtf8)
+        ));
     }
 
     #[test]

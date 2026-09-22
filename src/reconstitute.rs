@@ -64,6 +64,8 @@ pub struct ReconstitutionPlan {
 /// operation, so no transcript gets written for an unsupported harness.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconstitutionError {
+    #[error("qualified capture retrieval failed: {0}")]
+    QualifiedCapture(#[from] crate::qualified_capture::CaptureUploadError),
     #[error("HOME is required to locate the default Claude and checkout directories")]
     NoHome,
     #[error("session id must be a non-empty safe filename segment")]
@@ -146,27 +148,7 @@ impl ReconstitutionClient {
             });
         }
 
-        let repo_root = ensure_target_repo(&envelope, &locations.repos_root)?;
-        let target_cwd = relocated_cwd(&envelope, &repo_root)?;
-        if !target_cwd.is_dir() {
-            return Err(ReconstitutionError::MissingTargetCwd(
-                target_cwd.display().to_string(),
-            ));
-        }
-
-        let transcript_path = write_reconstituted_transcript(
-            &locations.claude_projects_root,
-            &target_cwd,
-            session_id,
-            &raw,
-        )?;
-
-        Ok(ReconstitutionPlan {
-            session_id: session_id.to_string(),
-            repo_root,
-            target_cwd,
-            transcript_path,
-        })
+        restore_claude(&envelope, &raw, session_id, locations)
     }
 
     async fn fetch_envelope(
@@ -218,6 +200,53 @@ impl ReconstitutionClient {
             None => request,
         }
     }
+}
+
+/// Restore an exact qualified version using separate envelope/raw credentials.
+pub async fn reconstitute_qualified(
+    reader: &crate::qualified_capture::QualifiedCaptureReader,
+    identity: &session_capture::inventory::QualifiedTranscript,
+    locations: &ReconstitutionLocations,
+) -> Result<ReconstitutionPlan, ReconstitutionError> {
+    validate_session_id(identity.native_session_id())?;
+    let capture = reader.fetch(identity).await?;
+    restore_claude(
+        &capture.envelope,
+        &capture.raw,
+        identity.native_session_id(),
+        locations,
+    )
+}
+
+fn restore_claude(
+    envelope: &SessionEnvelope,
+    raw: &[u8],
+    session_id: &str,
+    locations: &ReconstitutionLocations,
+) -> Result<ReconstitutionPlan, ReconstitutionError> {
+    validate_session_id(session_id)?;
+    ensure_claude(envelope)?;
+    let repo_root = ensure_target_repo(envelope, &locations.repos_root)?;
+    let target_cwd = relocated_cwd(envelope, &repo_root)?;
+    if !target_cwd.is_dir() {
+        return Err(ReconstitutionError::MissingTargetCwd(
+            target_cwd.display().to_string(),
+        ));
+    }
+
+    let transcript_path = write_reconstituted_transcript(
+        &locations.claude_projects_root,
+        &target_cwd,
+        session_id,
+        raw,
+    )?;
+
+    Ok(ReconstitutionPlan {
+        session_id: session_id.to_string(),
+        repo_root,
+        target_cwd,
+        transcript_path,
+    })
 }
 
 /// Launch Claude Code's native same-harness resume in the relocated worktree.
@@ -1193,8 +1222,63 @@ mod tests {
         ));
     }
 
+    // The restore invokes git while other tests mutate process-wide PATH.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn qualified_restore_writes_verified_raw_verbatim() {
+        use sha2::{Digest, Sha256};
+        let _guard = GLOBAL_LOCK.lock().unwrap();
+        let repos = tempfile::tempdir().unwrap();
+        let claude = tempfile::tempdir().unwrap();
+        let remote = "https://github.com/acme/widget.git";
+        let checkout = repos.path().join("acme/widget");
+        init_repo(&checkout, remote);
+        let raw = b"original\r\ntranscript\r\n";
+        let hash = format!("sha256:{:x}", Sha256::digest(raw));
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&envelope_json(remote, "/src/acme/widget")).unwrap();
+        envelope["content_hash"] = serde_json::json!(format!("sha256:{}", "a".repeat(64)));
+        envelope["stored_content_hash"] = serde_json::json!(hash);
+        let url = spawn_server(vec![
+            http_response(200, &[], &serde_json::to_vec(&envelope).unwrap()),
+            http_response(
+                200,
+                &[
+                    ("X-Source-Format", CLAUDE_SOURCE_FORMAT),
+                    ("X-Stored-Content-Hash", &hash),
+                ],
+                raw,
+            ),
+        ]);
+        let reader = crate::qualified_capture::QualifiedCaptureReader::new(
+            &url,
+            "read".into(),
+            "raw".into(),
+        )
+        .unwrap();
+        let identity = session_capture::inventory::QualifiedTranscript::new(
+            "source".into(),
+            "claude".into(),
+            "session-123".into(),
+        )
+        .unwrap();
+        let locations = ReconstitutionLocations {
+            repos_root: repos.path().into(),
+            claude_projects_root: claude.path().into(),
+        };
+        let plan = reconstitute_qualified(&reader, &identity, &locations)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&plan.transcript_path).unwrap(), raw);
+        assert_eq!(plan.session_id, "session-123");
+        assert_eq!(plan.repo_root, checkout.canonicalize().unwrap());
+    }
+
+    // The awaited restore spawns git; serialize with tests mutating PATH.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reconstitute_missing_target_cwd() {
+        let _guard = GLOBAL_LOCK.lock().unwrap();
         let remote = "https://github.com/acme/widget.git";
         let repos = tempfile::tempdir().unwrap();
         let claude = tempfile::tempdir().unwrap();

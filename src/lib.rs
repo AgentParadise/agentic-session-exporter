@@ -16,13 +16,18 @@
 // duplicate `must_use` annotation reported by current nightly Clippy.
 #![allow(clippy::double_must_use)]
 
+pub mod capture_outbox;
 pub mod config;
 pub mod cursor;
 pub mod gitmeta;
 pub mod health;
+pub mod inventory;
+pub mod inventory_outbox;
 pub mod parsers;
+pub mod qualified_capture;
 pub mod reconstitute;
 pub mod sources;
+pub mod spool;
 pub mod state;
 pub mod upload;
 

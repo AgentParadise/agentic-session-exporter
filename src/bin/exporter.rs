@@ -40,6 +40,14 @@ enum Command {
     Health,
     DryRun,
     RunOnce,
+    Spool,
+    InventoryEnqueue,
+    InventoryDrain(usize),
+    CaptureEnqueue,
+    CaptureReceipt,
+    CaptureDrain(usize),
+    SpoolList(u64, Option<u64>),
+    SpoolRead(u64),
     Loop(u64),
 }
 
@@ -61,6 +69,7 @@ struct Invocation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ArgError {
     UnknownFlag(String),
+    InvalidSpoolArguments,
     UnexpectedArgument(String),
     /// `--json` given with a mode that has no JSON result to emit.
     JsonUnsupportedMode,
@@ -71,6 +80,9 @@ enum ArgError {
 impl std::fmt::Display for ArgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidSpoolArguments => {
+                write!(f, "invalid or conflicting local spool arguments")
+            }
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
             Self::UnexpectedArgument(arg) => write!(f, "unexpected argument: {arg}"),
             Self::JsonUnsupportedMode => write!(
@@ -136,6 +148,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_usage();
             return Ok(());
         }
+        Command::InventoryEnqueue | Command::InventoryDrain(_) => {
+            return run_inventory(invocation.command).await;
+        }
+        Command::CaptureEnqueue | Command::CaptureReceipt | Command::CaptureDrain(_) => {
+            return run_capture_delivery(invocation.command).await;
+        }
+        Command::SpoolList(after, through) => {
+            let spool = agentic_session_exporter::spool::LocalSpool::open_readonly(&spool_root()?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&spool.page(after, through, 500)?)?
+            );
+            return Ok(());
+        }
+        Command::SpoolRead(sequence) => {
+            use std::io::Write;
+            let spool = agentic_session_exporter::spool::LocalSpool::open_readonly(&spool_root()?)?;
+            let limit = std::env::var("MAX_ENVELOPE_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(512 * 1024 * 1024);
+            std::io::stdout().write_all(&spool.read(sequence, limit)?)?;
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -146,7 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
     );
-    if invocation.json {
+    if invocation.json || matches!(invocation.command, Command::Spool) {
         subscriber.with_writer(std::io::stderr).init();
     } else {
         subscriber.init();
@@ -157,7 +194,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // stdout would otherwise get an empty stream, which reads as "no result"
     // rather than "this exporter is misconfigured". The store URL is unknown
     // here by definition, so it is reported as null rather than invented.
-    let mut cfg = match Config::from_env() {
+    let configuration = if matches!(invocation.command, Command::Spool) {
+        Config::from_env_local()
+    } else {
+        Config::from_env()
+    };
+    let mut cfg = match configuration {
         Ok(cfg) => cfg,
         Err(e) => {
             if invocation.json {
@@ -174,7 +216,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match invocation.command {
         // Handled above, before config was loaded.
-        Command::Version | Command::Help => unreachable!("version/help returned before config"),
+        Command::Version
+        | Command::Help
+        | Command::SpoolList(_, _)
+        | Command::SpoolRead(_)
+        | Command::InventoryEnqueue
+        | Command::InventoryDrain(_)
+        | Command::CaptureEnqueue
+        | Command::CaptureReceipt
+        | Command::CaptureDrain(_) => {
+            unreachable!("read-only commands returned before config")
+        }
         Command::Health => return run_health_check(&cfg),
         Command::DryRun => {
             let found = discover_all(&cfg)?;
@@ -189,6 +241,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|| "(none)".into()),
             );
             return Ok(());
+        }
+        Command::Spool => {
+            let summary = agentic_session_exporter::spool::capture_local(&cfg, &spool_root()?)?;
+            println!("{}", serde_json::to_string(&summary)?);
+            if summary.skipped_oversize > 0 {
+                std::process::exit(EXIT_INCOMPLETE);
+            }
         }
         Command::RunOnce => {
             // A hard failure must still produce a document under --json.
@@ -247,6 +306,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn parse_spool_cursor(value: &str) -> Result<(u64, Option<u64>), ArgError> {
+    let (after, through) = value
+        .split_once(':')
+        .map_or((value, None), |(a, b)| (a, Some(b)));
+    let after = after.parse().map_err(|_| ArgError::InvalidSpoolArguments)?;
+    let through = through
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| ArgError::InvalidSpoolArguments)?;
+    Ok((after, through))
+}
+
+fn spool_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let value = std::env::var_os("EXPORTER_SPOOL_DIR").ok_or(
+        agentic_session_exporter::config::ConfigError::Missing("EXPORTER_SPOOL_DIR"),
+    )?;
+    let root = std::path::PathBuf::from(value);
+    if !root.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "EXPORTER_SPOOL_DIR must be absolute",
+        )
+        .into());
+    }
+    Ok(root)
+}
+
 fn print_usage() {
     println!(
         "\
@@ -298,8 +384,24 @@ Exit codes for a capture sweep:
   1                  the sweep could not run (store unreachable, scan failure).
   {EXIT_USAGE}                  usage error.
 
+Local capture (no SESSION_STORE_URL or token needed):
+  --spool-only        archive one sweep into EXPORTER_SPOOL_DIR; emit JSON counts.
+  --spool-list N[:W] list at most 500 revisions after N, frozen through watermark W.
+  --spool-read N      write the exact archived SCS envelope for sequence N.
+EXPORTER_SPOOL_DIR must name an absolute persistent directory. Local counts
+report this sweep's discovered files, never independent capture completeness.
+
+Inventory replication (always emits JSON):
+  --capture-enqueue   durably queue one qualified envelope from stdin (at most 64 MiB).
+  --capture-receipt   look up a committed receipt for the qualified envelope on stdin.
+  --capture-drain N   retry at most N qualified captures (1..50); exit 3 if any remain.
+  --inventory-enqueue accept one operation JSON from stdin (at most 2 MiB).
+  --inventory-drain N retry at most N pending operations (1..500); exit 3 if any remain.
+Requires SESSION_STORE_URL, INVENTORY_WRITE_TOKEN and absolute EXPORTER_INVENTORY_DIR.
+Enqueue persists locally without network access. Drain is separate from capture.
+
 Configuration comes from the environment (SESSION_STORE_URL is required for
-every mode except --version and --help). Unrecognized arguments exit {EXIT_USAGE}.",
+remote modes, except --version and --help). Unrecognized arguments exit {EXIT_USAGE}.",
         bin = env!("CARGO_BIN_NAME"),
         version = env!("CARGO_PKG_VERSION"),
     );
@@ -318,6 +420,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
     let mut json = false;
     let mut ignore_state = false;
     let mut loop_secs: Option<u64> = None;
+    let mut spool_mode: Option<Command> = None;
     let mut cursor_limit: Option<usize> = None;
 
     let mut i = 0;
@@ -339,6 +442,65 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
             "--dry-run" => {
                 dry_run = true;
                 i += 1;
+            }
+            "--capture-enqueue" | "--capture-receipt" | "--capture-drain" => {
+                let (selected, consumed) = if arg == "--capture-enqueue" {
+                    (Command::CaptureEnqueue, 1)
+                } else if arg == "--capture-receipt" {
+                    (Command::CaptureReceipt, 1)
+                } else {
+                    let (value, consumed) = take_value(args, i);
+                    let limit = value
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|v| (1..=50).contains(v))
+                        .ok_or(ArgError::InvalidSpoolArguments)?;
+                    (Command::CaptureDrain(limit), consumed)
+                };
+                if spool_mode.replace(selected).is_some() {
+                    return Err(ArgError::InvalidSpoolArguments);
+                }
+                i += consumed;
+            }
+            "--inventory-enqueue" | "--inventory-drain" => {
+                let (selected, consumed) = if arg == "--inventory-enqueue" {
+                    (Command::InventoryEnqueue, 1)
+                } else {
+                    let (value, consumed) = take_value(args, i);
+                    let limit = value
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|v| (1..=500).contains(v))
+                        .ok_or(ArgError::InvalidSpoolArguments)?;
+                    (Command::InventoryDrain(limit), consumed)
+                };
+                if spool_mode.replace(selected).is_some() {
+                    return Err(ArgError::InvalidSpoolArguments);
+                }
+                i += consumed;
+            }
+            "--spool-only" => {
+                if spool_mode.replace(Command::Spool).is_some() {
+                    return Err(ArgError::InvalidSpoolArguments);
+                }
+                i += 1;
+            }
+            "--spool-list" | "--spool-read" => {
+                let (value, consumed) = take_value(args, i);
+                let value = value.ok_or(ArgError::InvalidSpoolArguments)?;
+                let selected = if arg == "--spool-list" {
+                    let (after, through) = parse_spool_cursor(value)?;
+                    Command::SpoolList(after, through)
+                } else {
+                    let sequence = value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|number| *number > 0)
+                        .ok_or(ArgError::InvalidSpoolArguments)?;
+                    Command::SpoolRead(sequence)
+                };
+                if spool_mode.replace(selected).is_some() {
+                    return Err(ArgError::InvalidSpoolArguments);
+                }
+                i += consumed;
             }
             "--json" => {
                 json = true;
@@ -374,10 +536,19 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
         }
     }
 
+    if !version
+        && !help
+        && spool_mode.is_some()
+        && (health || dry_run || loop_secs.is_some() || ignore_state || cursor_limit.is_some())
+    {
+        return Err(ArgError::InvalidSpoolArguments);
+    }
     let command = if version {
         Command::Version
     } else if help {
         Command::Help
+    } else if let Some(local) = spool_mode {
+        local
     } else if health {
         Command::Health
     } else if dry_run {
@@ -399,7 +570,12 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
     if json
         && matches!(
             command,
-            Command::Health | Command::DryRun | Command::Loop(_)
+            Command::Health
+                | Command::DryRun
+                | Command::Loop(_)
+                | Command::CaptureEnqueue
+                | Command::CaptureReceipt
+                | Command::CaptureDrain(_)
         )
     {
         return Err(ArgError::JsonUnsupportedMode);
@@ -584,6 +760,135 @@ fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+async fn run_capture_delivery(command: Command) -> Result<(), Box<dyn std::error::Error>> {
+    use agentic_session_exporter::{
+        capture_outbox::{CaptureOutbox, CaptureOutboxError},
+        qualified_capture::QualifiedCaptureClient,
+    };
+    use std::io::Read;
+    let required = |name| {
+        std::env::var(name)
+            .map_err(|_| agentic_session_exporter::config::ConfigError::Missing(name))
+    };
+    let client = QualifiedCaptureClient::new(
+        &required("SESSION_STORE_URL")?,
+        required("CAPTURE_WRITE_TOKEN")?,
+    )?;
+    let root = std::path::PathBuf::from(required("EXPORTER_CAPTURE_DIR")?);
+    if !root.is_absolute() {
+        return Err(CaptureOutboxError::Invalid.into());
+    }
+    let mut outbox = CaptureOutbox::open(&root, &client)?;
+    match command {
+        Command::CaptureEnqueue | Command::CaptureReceipt => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Request {
+                identity: session_capture::inventory::QualifiedTranscript,
+                envelope: session_capture::SessionEnvelope,
+            }
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(64 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 64 * 1024 * 1024 {
+                return Err(CaptureOutboxError::Invalid.into());
+            }
+            let text = std::str::from_utf8(&bytes).map_err(|_| CaptureOutboxError::Invalid)?;
+            let value = session_capture::content_hash::parse_ijson(text)
+                .map_err(|_| CaptureOutboxError::Invalid)?;
+            let request: Request =
+                serde_json::from_value(value).map_err(|_| CaptureOutboxError::Invalid)?;
+            if matches!(command, Command::CaptureReceipt) {
+                let mut envelope = request.envelope;
+                envelope.content_hash = None;
+                envelope
+                    .validate()
+                    .map_err(|_| CaptureOutboxError::Invalid)?;
+                if request.identity.native_session_id() != envelope.session_id {
+                    return Err(CaptureOutboxError::Invalid.into());
+                }
+                let hash = session_capture::content_hash_for(&envelope)
+                    .map_err(|_| CaptureOutboxError::Invalid)?;
+                let receipt = outbox.receipt(&request.identity, &hash)?;
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"receipt":receipt})
+                );
+                return Ok(());
+            }
+            let inserted = outbox.enqueue(&request.identity, &request.envelope)?;
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1,"inserted":inserted})
+            );
+        }
+        Command::CaptureDrain(limit) => {
+            let summary = outbox.drain(&client, limit).await?;
+            println!("{}", serde_json::to_string(&summary)?);
+            if summary.remaining > 0 {
+                std::process::exit(EXIT_INCOMPLETE);
+            }
+        }
+        _ => unreachable!("capture delivery mode required"),
+    }
+    Ok(())
+}
+
+async fn run_inventory(command: Command) -> Result<(), Box<dyn std::error::Error>> {
+    use agentic_session_exporter::{
+        inventory::InventoryClient,
+        inventory_outbox::{InventoryOperation, InventoryOutbox},
+    };
+    use std::io::Read;
+    let required = |name| {
+        std::env::var(name)
+            .map_err(|_| agentic_session_exporter::config::ConfigError::Missing(name))
+    };
+    let client = InventoryClient::new(
+        &required("SESSION_STORE_URL")?,
+        required("INVENTORY_WRITE_TOKEN")?,
+    )?;
+    let root = std::path::PathBuf::from(required("EXPORTER_INVENTORY_DIR")?);
+    if !root.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "EXPORTER_INVENTORY_DIR must be absolute",
+        )
+        .into());
+    }
+    let outbox = InventoryOutbox::open(&root, &client)?;
+    match command {
+        Command::InventoryEnqueue => {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(2 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 2 * 1024 * 1024 {
+                return Err(
+                    agentic_session_exporter::inventory_outbox::OutboxError::Invalid.into(),
+                );
+            }
+            let operation: InventoryOperation = serde_json::from_slice(&bytes)
+                .map_err(|_| agentic_session_exporter::inventory_outbox::OutboxError::Invalid)?;
+            let inserted = outbox.enqueue(&operation)?;
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1, "inserted":inserted})
+            );
+        }
+        Command::InventoryDrain(limit) => {
+            let summary = outbox.drain(&client, limit).await?;
+            println!("{}", serde_json::to_string(&summary)?);
+            if summary.remaining > 0 {
+                std::process::exit(EXIT_INCOMPLETE);
+            }
+        }
+        _ => unreachable!("inventory mode required"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
