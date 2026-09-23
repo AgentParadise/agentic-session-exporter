@@ -152,6 +152,7 @@ pub fn read_codex(
     }
 
     let mut session_id = fallback_id.to_string();
+    let mut saw_header = false;
     let mut meta = Metadata::default();
     let mut message_count: u64 = 0;
     let mut first_ts: Option<DateTime<Utc>> = None;
@@ -165,7 +166,9 @@ pub fn read_codex(
             }
         }
         match row.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-            "session_meta" => {
+            "session_meta" if !saw_header => {
+                // Forked histories can repeat ancestor headers after this one.
+                saw_header = true;
                 if let Some(payload) = row.get("payload") {
                     if let Some(id) = payload.get("id").and_then(|x| x.as_str()) {
                         if !id.is_empty() {
@@ -373,6 +376,23 @@ mod tests {
         let env = read_codex(jsonl.as_bytes(), "stem", origin()).unwrap();
         assert_eq!(env.session_id, "x");
         assert_eq!(env.metadata.as_ref().unwrap().message_count, Some(1));
+    }
+
+    #[test]
+    fn codex_preserves_child_identity_before_inherited_parent_header() {
+        let raw = concat!(
+            r#"{"type":"session_meta","payload":{"id":"child","session_id":"root","multi_agent_version":"v2","cwd":"/child"}}"#,
+            "\n",
+            r#"{"type":"session_meta","payload":{"id":"root","cwd":"/parent"}}"#,
+            "\n"
+        );
+        let env = read_codex(raw.as_bytes(), "fallback", origin()).unwrap();
+        assert_eq!(env.session_id, "child");
+        assert_eq!(
+            env.metadata.as_ref().unwrap().cwd.as_deref(),
+            Some("/child")
+        );
+        assert_eq!(env.raw.as_str().unwrap(), raw);
     }
 
     #[test]
