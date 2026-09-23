@@ -601,7 +601,27 @@ fn capture_delivery_cli_restarts_without_losing_pending_envelopes() {
     let result: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(result["failed"], 1);
     assert_eq!(result["remaining"], 1);
+    let value: serde_json::Value = serde_json::from_str(&input).unwrap();
+    let envelope: session_capture::SessionEnvelope =
+        serde_json::from_value(value["envelope"].clone()).unwrap();
+    let deletion = serde_json::json!({"identity":value["identity"],"content_hash":session_capture::content_hash_for(&envelope).unwrap()}).to_string();
+    for inserted in [true, false] {
+        let result = send("--capture-delete", &deletion);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()["inserted"],
+            inserted
+        );
+    }
+    assert!(!send("--capture-enqueue", &input).status.success());
+    assert!(!send("--capture-delete", "{}").status.success());
     for args in [
+        vec!["--capture-delete", "--json"],
+        vec!["--capture-delete", "--capture-enqueue"],
         vec!["--capture-receipt", "--json"],
         vec!["--capture-receipt", "--capture-enqueue"],
         vec!["--capture-drain", "0"],

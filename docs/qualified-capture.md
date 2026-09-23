@@ -64,3 +64,22 @@ a committed receipt includes `storage_key`, `content_hash`,
 `stored_content_hash`, and `duplicate`. Receipt lookup survives process restart
 and never treats enqueue acceptance as remote acceptance. It shares the capture
 input limit and rejects sweep options and `--json`.
+
+
+## Durable exact-revision deletion
+
+`--capture-delete` reads at most 16 KiB of JSON containing `identity` (the same
+qualified source, harness and native ID as capture) and `content_hash` (the exact
+original APSS SHA-256). It persists a deletion request in the destination-bound
+capture outbox. Repeating it is idempotent. Re-enqueue of that revision is rejected
+and receipt lookup no longer reports the historical acceptance as current access.
+
+`--capture-drain` sends pending DELETE requests before uploads, within its existing
+operation limit. Only HTTP 204 acknowledges deletion. Failed requests survive
+restart; credentials and response bodies are excluded from errors. A store's 410
+upload response permanently cancels that upload and queues idempotent deletion.
+SQLite schema version 2 preserves existing deliveries during upgrade.
+
+This prevents queued transmission and remote resurrection once the store accepts
+the tombstone. It does not yet erase envelope files retained in the exporter's
+local spool. Host scheduling and complete physical-copy cleanup remain required.

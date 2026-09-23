@@ -44,6 +44,7 @@ enum Command {
     InventoryEnqueue,
     InventoryDrain(usize),
     CaptureEnqueue,
+    CaptureDelete,
     CaptureReceipt,
     CaptureDrain(usize),
     SpoolList(u64, Option<u64>),
@@ -151,7 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::InventoryEnqueue | Command::InventoryDrain(_) => {
             return run_inventory(invocation.command).await;
         }
-        Command::CaptureEnqueue | Command::CaptureReceipt | Command::CaptureDrain(_) => {
+        Command::CaptureEnqueue
+        | Command::CaptureReceipt
+        | Command::CaptureDelete
+        | Command::CaptureDrain(_) => {
             return run_capture_delivery(invocation.command).await;
         }
         Command::SpoolList(after, through) => {
@@ -224,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         | Command::InventoryDrain(_)
         | Command::CaptureEnqueue
         | Command::CaptureReceipt
+        | Command::CaptureDelete
         | Command::CaptureDrain(_) => {
             unreachable!("read-only commands returned before config")
         }
@@ -393,6 +398,7 @@ report this sweep's discovered files, never independent capture completeness.
 
 Inventory replication (always emits JSON):
   --capture-enqueue   durably queue one qualified envelope from stdin (at most 64 MiB).
+  --capture-delete    durably queue exact qualified revision deletion from stdin (at most 16 KiB).
   --capture-receipt   look up a committed receipt for the qualified envelope on stdin.
   --capture-drain N   retry at most N qualified captures (1..50); exit 3 if any remain.
   --inventory-enqueue accept one operation JSON from stdin (at most 2 MiB).
@@ -443,9 +449,11 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
                 dry_run = true;
                 i += 1;
             }
-            "--capture-enqueue" | "--capture-receipt" | "--capture-drain" => {
+            "--capture-enqueue" | "--capture-receipt" | "--capture-delete" | "--capture-drain" => {
                 let (selected, consumed) = if arg == "--capture-enqueue" {
                     (Command::CaptureEnqueue, 1)
+                } else if arg == "--capture-delete" {
+                    (Command::CaptureDelete, 1)
                 } else if arg == "--capture-receipt" {
                     (Command::CaptureReceipt, 1)
                 } else {
@@ -575,6 +583,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
                 | Command::Loop(_)
                 | Command::CaptureEnqueue
                 | Command::CaptureReceipt
+                | Command::CaptureDelete
                 | Command::CaptureDrain(_)
         )
     {
@@ -781,6 +790,28 @@ async fn run_capture_delivery(command: Command) -> Result<(), Box<dyn std::error
         return Err(CaptureOutboxError::Invalid.into());
     }
     let mut outbox = CaptureOutbox::open(&root, &client)?;
+    if matches!(command, Command::CaptureDelete) {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Deletion {
+            identity: session_capture::inventory::QualifiedTranscript,
+            content_hash: String,
+        }
+        let mut bytes = Vec::new();
+        std::io::stdin().take(16385).read_to_end(&mut bytes)?;
+        if bytes.len() > 16384 {
+            return Err(CaptureOutboxError::Invalid.into());
+        }
+        let request: Deletion =
+            serde_json::from_slice(&bytes).map_err(|_| CaptureOutboxError::Invalid)?;
+        let inserted = outbox.enqueue_deletion(&request.identity, &request.content_hash)?;
+        println!(
+            "{}",
+            serde_json::json!({"schema_version":1,"inserted":inserted})
+        );
+        return Ok(());
+    }
+
     match command {
         Command::CaptureEnqueue | Command::CaptureReceipt => {
             #[derive(serde::Deserialize)]

@@ -21,6 +21,15 @@ pub enum CaptureUploadError {
     Receipt,
 }
 
+pub(crate) fn valid_content_hash(hash: &str) -> bool {
+    hash.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// Intentionally no Debug: this owns the scoped capture credential.
 pub struct QualifiedCaptureClient {
     http: reqwest::Client,
@@ -61,6 +70,33 @@ impl QualifiedCaptureClient {
             endpoint,
             token,
         })
+    }
+
+    pub async fn delete(
+        &self,
+        identity: &QualifiedTranscript,
+        content_hash: &str,
+    ) -> Result<(), CaptureUploadError> {
+        if !valid_content_hash(content_hash) {
+            return Err(CaptureUploadError::Invalid);
+        }
+        let mut url = self.endpoint.clone();
+        url.query_pairs_mut()
+            .append_pair("source_instance_id", identity.source_instance_id())
+            .append_pair("harness", identity.harness())
+            .append_pair("native_session_id", identity.native_session_id())
+            .append_pair("content_hash", content_hash);
+        let response = self
+            .http
+            .delete(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| CaptureUploadError::Transport)?;
+        if response.status().as_u16() != 204 {
+            return Err(CaptureUploadError::Status(response.status().as_u16()));
+        }
+        Ok(())
     }
 
     pub async fn upload(
