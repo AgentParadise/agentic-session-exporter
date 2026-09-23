@@ -78,11 +78,14 @@ and receipt lookup no longer reports the historical acceptance as current access
 operation limit. Only HTTP 204 acknowledges deletion. Failed requests survive
 restart; credentials and response bodies are excluded from errors. A store's 410
 upload response permanently cancels that upload and queues idempotent deletion.
-SQLite schema version 2 preserves existing deliveries during upgrade.
+SQLite schema version 3 preserves existing deliveries during upgrade.
 
 This prevents queued transmission and remote resurrection once the store accepts
-the tombstone. It does not yet erase envelope files retained in the exporter's
-local spool. Host scheduling and complete physical-copy cleanup remain required.
+the tombstone. Drain also removes deleted envelope files from the outbox spool,
+bounded by the operation limit. A shared file remains while another qualified
+identity still needs delivery. Legacy hashes are durably backfilled before
+unlink, and cleanup repeats safely after interruption. Identity, receipt and
+tombstone metadata remain; this does not purge workspace source transcripts.
 
 `--envelope-hash` validates an envelope from bounded stdin and returns its original
 APSS content hash. It requires no configuration, writes no state, and performs no

@@ -91,7 +91,7 @@ impl CaptureOutbox {
         let version: u32 = tx
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(storage)?;
-        if version > 2 {
+        if version > 3 {
             return Err(CaptureOutboxError::Invalid);
         }
         tx.execute_batch("CREATE TABLE IF NOT EXISTS destination(singleton INTEGER PRIMARY KEY CHECK(singleton=1),hash TEXT NOT NULL);
@@ -110,6 +110,15 @@ impl CaptureOutbox {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS capture_deletions(storage_key TEXT NOT NULL,
             content_hash TEXT NOT NULL,identity TEXT NOT NULL,acknowledged INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(storage_key,content_hash));").map_err(storage)?;
+        if version < 3 {
+            tx.execute_batch(
+                "ALTER TABLE deliveries ADD COLUMN content_hash TEXT;
+                ALTER TABLE deliveries ADD COLUMN erased INTEGER NOT NULL DEFAULT 0;
+                CREATE INDEX deliveries_content ON deliveries(storage_key,content_hash);
+                PRAGMA user_version=3;",
+            )
+            .map_err(storage)?;
+        }
         tx.commit().map_err(storage)?;
         let destination = destination(client);
         db.execute(
@@ -150,7 +159,12 @@ impl CaptureOutbox {
             .map_err(|_| CaptureOutboxError::Invalid)?;
         let hash = session_capture::content_hash_for(&envelope)
             .map_err(|_| CaptureOutboxError::Invalid)?;
-        if self.deleted(identity, &hash)? {
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let deleted: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM capture_deletions WHERE storage_key=?1 AND content_hash=?2)",params![identity.storage_key(),&hash],|r|r.get(0)).map_err(storage)?;
+        if deleted {
             return Err(CaptureOutboxError::Deleted);
         }
         if serde_json::to_vec(&envelope).map_err(storage)?.len() > 64 * 1024 * 1024 {
@@ -158,10 +172,9 @@ impl CaptureOutbox {
         }
         let (entry, _) = self.spool.store(&envelope).map_err(storage)?;
         let encoded = serde_json::to_string(identity).map_err(storage)?;
-        let inserted=self.db.execute("INSERT OR IGNORE INTO deliveries(storage_key,spool_sequence,identity) VALUES(?1,?2,?3)",
-            params![identity.storage_key(),entry.sequence,encoded]).map_err(storage)?;
-        let actual: String = self
-            .db
+        let inserted=tx.execute("INSERT OR IGNORE INTO deliveries(storage_key,spool_sequence,identity,content_hash) VALUES(?1,?2,?3,?4)",
+            params![identity.storage_key(),entry.sequence,encoded,&hash]).map_err(storage)?;
+        let actual: String = tx
             .query_row(
                 "SELECT identity FROM deliveries WHERE storage_key=?1 AND spool_sequence=?2",
                 params![identity.storage_key(), entry.sequence],
@@ -171,6 +184,12 @@ impl CaptureOutbox {
         if actual != encoded {
             return Err(CaptureOutboxError::Invalid);
         }
+        tx.execute(
+            "UPDATE deliveries SET erased=0 WHERE spool_sequence=?1",
+            [entry.sequence],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)?;
         Ok(inserted == 1)
     }
 
@@ -253,6 +272,7 @@ impl CaptureOutbox {
                 Err(_) => result.failed += 1,
             }
         }
+        self.cleanup(limit)?;
         result.remaining = self
             .db
             .query_row(
@@ -270,6 +290,62 @@ impl CaptureOutbox {
             )
             .map_err(storage)?;
         Ok(result)
+    }
+
+    fn cleanup(&self, limit: usize) -> Result<(), CaptureOutboxError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(storage)?;
+        // Upgrade legacy rows incrementally while their original bytes remain.
+        let legacy = {
+            let mut q = tx.prepare("SELECT sequence,spool_sequence FROM deliveries WHERE content_hash IS NULL LIMIT ?1").map_err(storage)?;
+            let rows = q
+                .query_map([limit as u32], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, u64>(1)?))
+                })
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?;
+            rows
+        };
+        for (sequence, spool) in legacy {
+            let bytes = self.spool.read(spool, 64 * 1024 * 1024).map_err(storage)?;
+            let envelope: SessionEnvelope = serde_json::from_slice(&bytes).map_err(storage)?;
+            let hash = session_capture::content_hash_for(&envelope).map_err(storage)?;
+            tx.execute(
+                "UPDATE deliveries SET content_hash=?2 WHERE sequence=?1",
+                params![sequence, hash],
+            )
+            .map_err(storage)?;
+        }
+        tx.commit().map_err(storage)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(storage)?;
+        let candidates = {
+            let mut q = tx.prepare("SELECT DISTINCT d.spool_sequence FROM deliveries d
+                JOIN capture_deletions t ON t.storage_key=d.storage_key AND t.content_hash=d.content_hash
+                WHERE NOT d.erased AND NOT EXISTS(SELECT 1 FROM deliveries other
+                    WHERE other.spool_sequence=d.spool_sequence AND other.receipt IS NULL
+                    AND NOT EXISTS(SELECT 1 FROM capture_deletions x WHERE x.storage_key=other.storage_key AND x.content_hash=other.content_hash))
+                LIMIT ?1").map_err(storage)?;
+            let rows = q
+                .query_map([limit as u32], |r| r.get::<_, u64>(0))
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?;
+            rows
+        };
+        for spool in candidates {
+            self.spool.discard_body(spool).map_err(storage)?;
+            tx.execute("UPDATE deliveries SET erased=1,cancelled=CASE WHEN receipt IS NULL THEN 1 ELSE cancelled END WHERE spool_sequence=?1",[spool]).map_err(storage)?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(())
     }
 
     fn deleted(
@@ -335,6 +411,56 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    #[test]
+    fn cleanup_preserves_shared_pending_identity_and_retries_after_unlink() {
+        let root = tempfile::tempdir().unwrap();
+        let client = QualifiedCaptureClient::new("http://127.0.0.1:1", "test".into()).unwrap();
+        let envelope:SessionEnvelope=serde_json::from_value(serde_json::json!({
+            "scs_version":"1.0","origin":{"host":"test","environment":"local"},
+            "agent":"codex","source_format":"codex-rollout-jsonl","session_id":"native",
+            "started_at":"2026-09-22T00:00:00Z","last_activity_at":"2026-09-22T00:00:01Z","raw":"body"
+        })).unwrap();
+        let a = QualifiedTranscript::new("a".into(), "codex".into(), "native".into()).unwrap();
+        let b = QualifiedTranscript::new("b".into(), "codex".into(), "native".into()).unwrap();
+        let hash = session_capture::content_hash_for(&envelope).unwrap();
+        let mut queue = CaptureOutbox::open(root.path(), &client).unwrap();
+        queue.enqueue(&a, &envelope).unwrap();
+        queue.enqueue(&b, &envelope).unwrap();
+        // Version-2 rows need a durable hash backfill before any object removal.
+        queue
+            .db
+            .execute("UPDATE deliveries SET content_hash=NULL", [])
+            .unwrap();
+        queue.enqueue_deletion(&a, &hash).unwrap();
+        queue.cleanup(1).unwrap();
+        assert!(queue.spool.read(1, 4096).is_ok());
+        queue.cleanup(1).unwrap();
+        assert!(queue.spool.read(1, 4096).is_ok());
+        queue.enqueue_deletion(&b, &hash).unwrap();
+        queue.cleanup(1).unwrap();
+        assert!(queue.spool.read(1, 4096).is_err());
+        assert_eq!(
+            std::fs::read_dir(root.path().join("captures/objects"))
+                .unwrap()
+                .count(),
+            0
+        );
+        // Recreate the state left by interruption after unlink, before the
+        // cleanup transaction acknowledged erasure. Persisted hashes survive.
+        queue
+            .db
+            .execute("UPDATE deliveries SET erased=0", [])
+            .unwrap();
+        drop(queue);
+        let mut restarted = CaptureOutbox::open(root.path(), &client).unwrap();
+        restarted.cleanup(1).unwrap();
+        assert!(matches!(
+            restarted.enqueue(&a, &envelope),
+            Err(CaptureOutboxError::Deleted)
+        ));
+        assert!(restarted.spool.read(1, 4096).is_err());
+    }
+
     #[tokio::test]
     async fn deletion_survives_failure_restart_and_cancels_queued_upload() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -385,10 +511,10 @@ mod tests {
             }
         });
         let first = queue.drain(&client, 1).await.unwrap();
-        assert_eq!((first.failed, first.remaining), (1, 2));
+        assert_eq!((first.failed, first.remaining), (1, 1));
         drop(queue);
         let queue = CaptureOutbox::open(root.path(), &client).unwrap();
-        assert_eq!(queue.drain(&client, 1).await.unwrap().remaining, 1);
+        assert_eq!(queue.drain(&client, 1).await.unwrap().remaining, 0);
         drop(queue);
         let queue = CaptureOutbox::open(root.path(), &client).unwrap();
         let last = queue.drain(&client, 1).await.unwrap();

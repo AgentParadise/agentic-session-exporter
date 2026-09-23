@@ -155,6 +155,31 @@ impl LocalSpool {
         Ok((entry, inserted))
     }
 
+    /// The owning outbox must serialize this with its writers and prove that
+    /// no undelivered identity still requires these bytes. Metadata is retained.
+    pub(crate) fn discard_body(&self, sequence: u64) -> Result<(), SpoolError> {
+        let digest: String = self.db.query_row(
+            "SELECT archive_sha256 FROM envelope_revisions WHERE sequence=?1",
+            [sequence],
+            |r| r.get(0),
+        )?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(SpoolError::Integrity);
+        }
+        let directory = self.root.join("objects");
+        match fs::remove_file(directory.join(digest)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(SpoolError::Io(error)),
+        }
+        sync_directory(&directory)?;
+        Ok(())
+    }
+
     pub fn watermark(&self) -> Result<u64, SpoolError> {
         Ok(self.db.query_row(
             "SELECT COALESCE(MAX(sequence),0) FROM envelope_revisions",

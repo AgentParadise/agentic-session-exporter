@@ -550,9 +550,13 @@ fn capture_delivery_cli_restarts_without_losing_pending_envelopes() {
         "source_format":"codex-rollout-jsonl","session_id":"native","started_at":"2026-09-22T00:00:00Z",
         "last_activity_at":"2026-09-22T00:00:01Z","raw":"exact\r\n"}}).to_string();
     let value: serde_json::Value = serde_json::from_str(&input).unwrap();
-    let mut hasher = bin()
-        .arg("--envelope-hash")
-        .env_clear()
+    let mut hash_command = bin();
+    hash_command.arg("--envelope-hash").env_clear();
+    // Preserve test instrumentation only; no application configuration survives.
+    if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+        hash_command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let mut hasher = hash_command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
