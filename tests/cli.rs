@@ -549,6 +549,33 @@ fn capture_delivery_cli_restarts_without_losing_pending_envelopes() {
         "envelope":{"scs_version":"1.0","origin":{"host":"test","environment":"local"},"agent":"codex",
         "source_format":"codex-rollout-jsonl","session_id":"native","started_at":"2026-09-22T00:00:00Z",
         "last_activity_at":"2026-09-22T00:00:01Z","raw":"exact\r\n"}}).to_string();
+    let value: serde_json::Value = serde_json::from_str(&input).unwrap();
+    let mut hasher = bin()
+        .arg("--envelope-hash")
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hasher
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(value["envelope"].to_string().as_bytes())
+        .unwrap();
+    let hashed = hasher.wait_with_output().unwrap();
+    assert!(
+        hashed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hashed.stderr)
+    );
+    let envelope: session_capture::SessionEnvelope =
+        serde_json::from_value(value["envelope"].clone()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&hashed.stdout).unwrap()["content_hash"],
+        session_capture::content_hash_for(&envelope).unwrap()
+    );
     let configured = || {
         let mut command = bin();
         command

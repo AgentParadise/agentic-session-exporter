@@ -45,6 +45,7 @@ enum Command {
     InventoryDrain(usize),
     CaptureEnqueue,
     CaptureDelete,
+    EnvelopeHash,
     CaptureReceipt,
     CaptureDrain(usize),
     SpoolList(u64, Option<u64>),
@@ -149,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_usage();
             return Ok(());
         }
+        Command::EnvelopeHash => return run_envelope_hash(),
         Command::InventoryEnqueue | Command::InventoryDrain(_) => {
             return run_inventory(invocation.command).await;
         }
@@ -222,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Handled above, before config was loaded.
         Command::Version
         | Command::Help
+        | Command::EnvelopeHash
         | Command::SpoolList(_, _)
         | Command::SpoolRead(_)
         | Command::InventoryEnqueue
@@ -398,6 +401,7 @@ report this sweep's discovered files, never independent capture completeness.
 
 Inventory replication (always emits JSON):
   --capture-enqueue   durably queue one qualified envelope from stdin (at most 64 MiB).
+  --envelope-hash     validate and hash an envelope on stdin without configuration or storage.
   --capture-delete    durably queue exact qualified revision deletion from stdin (at most 16 KiB).
   --capture-receipt   look up a committed receipt for the qualified envelope on stdin.
   --capture-drain N   retry at most N qualified captures (1..50); exit 3 if any remain.
@@ -449,9 +453,12 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
                 dry_run = true;
                 i += 1;
             }
-            "--capture-enqueue" | "--capture-receipt" | "--capture-delete" | "--capture-drain" => {
+            "--envelope-hash" | "--capture-enqueue" | "--capture-receipt" | "--capture-delete"
+            | "--capture-drain" => {
                 let (selected, consumed) = if arg == "--capture-enqueue" {
                     (Command::CaptureEnqueue, 1)
+                } else if arg == "--envelope-hash" {
+                    (Command::EnvelopeHash, 1)
                 } else if arg == "--capture-delete" {
                     (Command::CaptureDelete, 1)
                 } else if arg == "--capture-receipt" {
@@ -581,6 +588,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
             Command::Health
                 | Command::DryRun
                 | Command::Loop(_)
+                | Command::EnvelopeHash
                 | Command::CaptureEnqueue
                 | Command::CaptureReceipt
                 | Command::CaptureDelete
@@ -769,6 +777,34 @@ fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn run_envelope_hash() -> Result<(), Box<dyn std::error::Error>> {
+    use agentic_session_exporter::capture_outbox::CaptureOutboxError;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(64 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err(CaptureOutboxError::Invalid.into());
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| CaptureOutboxError::Invalid)?;
+    let value = session_capture::content_hash::parse_ijson(text)
+        .map_err(|_| CaptureOutboxError::Invalid)?;
+    let mut envelope: session_capture::SessionEnvelope =
+        serde_json::from_value(value).map_err(|_| CaptureOutboxError::Invalid)?;
+    envelope.content_hash = None;
+    envelope
+        .validate()
+        .map_err(|_| CaptureOutboxError::Invalid)?;
+    let hash =
+        session_capture::content_hash_for(&envelope).map_err(|_| CaptureOutboxError::Invalid)?;
+    println!(
+        "{}",
+        serde_json::json!({"schema_version":1,"content_hash":hash})
+    );
+    Ok(())
 }
 
 async fn run_capture_delivery(command: Command) -> Result<(), Box<dyn std::error::Error>> {

@@ -83,3 +83,8 @@ SQLite schema version 2 preserves existing deliveries during upgrade.
 This prevents queued transmission and remote resurrection once the store accepts
 the tombstone. It does not yet erase envelope files retained in the exporter's
 local spool. Host scheduling and complete physical-copy cleanup remain required.
+
+`--envelope-hash` validates an envelope from bounded stdin and returns its original
+APSS content hash. It requires no configuration, writes no state, and performs no
+network request. Origin retention uses it to persist deletion identity before
+removing local bytes, without duplicating canonical hashing in another language.
