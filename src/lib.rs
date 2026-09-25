@@ -130,11 +130,17 @@ fn origin_of(cfg: &Config) -> Origin {
     origin
 }
 
+/// Most Cursor threads a streaming sweep holds candidates for. Real databases
+/// hold low thousands; beyond this, older threads are reported as overflow.
+pub const CURSOR_MAX_THREADS: usize = 100_000;
+
 /// Streaming discovery for callers that must not hold the corpus in memory.
 /// Claude and Codex files larger than `limit` bytes are reported as
 /// [`sources::Found::Oversize`] without being read; each other transcript is
-/// handed to `visit` and dropped before the next is read. Cursor threads come
-/// from one database query and are bounded by `cursor_limit`.
+/// handed to `visit` and dropped before the next is read. Directories are
+/// walked without buffering their listings. Cursor threads are streamed newest
+/// first under [`CURSOR_MAX_THREADS`] and the same byte bound, with anything
+/// left out reported as oversize or overflow.
 pub fn visit_all<E>(
     cfg: &Config,
     limit: u64,
@@ -154,10 +160,29 @@ pub fn visit_all<E>(
     sources::visit_claude(&cfg.claude_root, &origin, limit, &mut stamped)?;
     sources::visit_codex(&cfg.codex_root, &origin, limit, &mut stamped)?;
     if let Some(db) = &cfg.cursor_db {
-        for discovered in sources::discover_cursor(db, &origin, cfg.cursor_limit)? {
-            stamped(Found::Transcript(Box::new(discovered)))
-                .map_err(sources::VisitError::Visitor)?;
-        }
+        let bounds = cursor::ThreadBounds {
+            max_threads: CURSOR_MAX_THREADS,
+            max_bytes: limit,
+        };
+        cursor::visit_threads(db, &origin, cfg.cursor_limit, bounds, &mut |item| {
+            stamped(match item {
+                cursor::ThreadItem::Thread(thread) => {
+                    let thread = *thread;
+                    Found::Transcript(Box::new(sources::Discovered {
+                        path: sources::cursor_path(db, &thread.envelope.session_id),
+                        fingerprint: thread.fingerprint,
+                        envelope: thread.envelope,
+                    }))
+                }
+                cursor::ThreadItem::Oversize(key) => Found::Oversize(sources::cursor_path(
+                    db,
+                    key.strip_prefix("composerData:").unwrap_or(&key),
+                )),
+                cursor::ThreadItem::Overflow(count) => Found::Overflow(count),
+            })
+        })
+        .map_err(|error| sources::VisitError::Source(error.into()))?
+        .map_err(sources::VisitError::Visitor)?;
     }
     Ok(())
 }
@@ -1098,14 +1123,18 @@ mod tests {
         assert!(visited
             .iter()
             .all(|v| v.1.contains(&"ci:run:7".to_string())));
-        // Over the bound, a source file is reported without being parsed.
-        let mut oversize = 0;
+        // Over the bound, a source file and a Cursor thread are each reported
+        // without being parsed or assembled.
+        let mut oversize = Vec::new();
         visit_all(&cfg, 1, &mut |found| {
-            oversize += usize::from(matches!(found, sources::Found::Oversize(_)));
+            if let sources::Found::Oversize(path) = found {
+                oversize.push(path.display().to_string());
+            }
             Ok::<(), ()>(())
         })
         .unwrap();
-        assert_eq!(oversize, 1);
+        assert_eq!(oversize.len(), 2);
+        assert!(oversize[1].ends_with("state.vscdb#composer:c1"));
         // A visitor failure stops the sweep and is returned as the visitor's.
         let stopped = visit_all(&cfg, u64::MAX, &mut |found| match found {
             sources::Found::Transcript(d) if d.envelope.source_format.starts_with("cursor") => {

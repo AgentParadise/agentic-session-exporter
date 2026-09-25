@@ -9,6 +9,15 @@
 //! tombstone and never goes out) or entirely after it (and removes what the
 //! upload stored). The store remains the final authority: a revision it holds
 //! a tombstone for is refused with 410, which is terminal withdrawal here.
+//!
+//! Leases are fenced. Each grant of a revision's lease carries a token one
+//! higher than the last grant of that revision, and the holder re-proves it
+//! still holds that exact token immediately before sending and again, inside
+//! the committing transaction, before recording any result. Wall-clock time
+//! only decides when an abandoned lease may be taken over; it never decides
+//! who may act. A holder paused or clock-jumped past expiry whose lease was
+//! taken over therefore neither sends nor commits: it reports `fenced` and the
+//! row stays pending for a later pass to resolve against the new state.
 use crate::{
     qualified_capture::{CaptureUploadError, QualifiedCaptureClient},
     secure_fs::{sqlite_flags, SecureDir},
@@ -44,6 +53,9 @@ pub struct CaptureDrainSummary {
     /// Uploads the store refused with 410 because it holds a deletion for the
     /// revision. Terminal: never retried, and the queued body is dropped.
     pub withdrawn: usize,
+    /// Requests abandoned because this drain's lease was taken over while it
+    /// was paused, before sending or before committing the result. Pending.
+    pub fenced: usize,
     /// Revisions skipped this pass because another process holds their lease
     /// (an upload or deletion in flight). They stay pending.
     pub busy: usize,
@@ -56,7 +68,7 @@ pub struct CaptureDrainSummary {
 }
 
 const DATABASE: &str = "capture-delivery.sqlite3";
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const MAX_BODY: usize = 64 * 1024 * 1024;
 /// Far longer than the 30 second request timeout, so a live holder never
 /// loses its lease, while a holder that died releases it without an operator.
@@ -68,6 +80,23 @@ pub struct CaptureOutbox {
     spool: LocalSpool,
     destination: String,
     owner: String,
+    #[cfg(test)]
+    pause: Option<Pause>,
+}
+
+/// Points in one remote request where a test can hold a drain.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    BeforeSend,
+    BeforeCommit,
+}
+
+#[cfg(test)]
+struct Pause {
+    stage: Stage,
+    reached: std::sync::Arc<tokio::sync::Notify>,
+    resume: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// Why a queued row could not be turned into a request.
@@ -78,19 +107,62 @@ enum Unusable {
     Transient,
 }
 
-/// Exclusive right to send remote requests for one qualified revision.
+/// Exclusive, fenced right to send remote requests for one qualified revision.
 struct Lease<'a> {
     db: &'a Connection,
     key: String,
     hash: String,
     owner: &'a str,
+    token: i64,
+}
+
+impl Lease<'_> {
+    /// Re-prove this exact grant is still current and extend it. False once
+    /// another holder has taken the lease over, however long ago that was.
+    fn renew(&self) -> Result<bool, CaptureOutboxError> {
+        let renewed = self
+            .db
+            .execute(
+                "UPDATE revision_leases SET expires_at=?5
+                 WHERE storage_key=?1 AND content_hash=?2 AND owner=?3 AND token=?4",
+                params![
+                    self.key,
+                    self.hash,
+                    self.owner,
+                    self.token,
+                    now() + LEASE_SECS
+                ],
+            )
+            .map_err(storage)?;
+        Ok(renewed == 1)
+    }
+
+    /// Open the transaction that records a result, or `None` if this grant is
+    /// no longer current. The check and the writes share one write lock, so a
+    /// takeover cannot land between them.
+    fn commit(&self) -> Result<Option<Transaction<'_>>, CaptureOutboxError> {
+        let tx =
+            Transaction::new_unchecked(self.db, TransactionBehavior::Immediate).map_err(storage)?;
+        let held: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM revision_leases
+                 WHERE storage_key=?1 AND content_hash=?2 AND owner=?3 AND token=?4)",
+                params![self.key, self.hash, self.owner, self.token],
+                |r| r.get(0),
+            )
+            .map_err(storage)?;
+        Ok(held.then_some(tx))
+    }
 }
 
 impl Drop for Lease<'_> {
+    /// Release by expiring, never deleting: the row keeps the token so the
+    /// next grant of this revision is still numbered above this one.
     fn drop(&mut self) {
         let _ = self.db.execute(
-            "DELETE FROM revision_leases WHERE storage_key=?1 AND content_hash=?2 AND owner=?3",
-            params![self.key, self.hash, self.owner],
+            "UPDATE revision_leases SET expires_at=0
+             WHERE storage_key=?1 AND content_hash=?2 AND owner=?3 AND token=?4",
+            params![self.key, self.hash, self.owner, self.token],
         );
     }
 }
@@ -113,6 +185,26 @@ fn owner_token() -> String {
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// The store holds a tombstone for this revision. Record it as an
+/// acknowledged local deletion, so it is never uploaded or re-enqueued, and
+/// cleanup drops the queued body without sending a DELETE.
+fn withdraw(
+    tx: &Transaction<'_>,
+    sequence: i64,
+    identity: &QualifiedTranscript,
+    hash: &str,
+) -> Result<(), CaptureOutboxError> {
+    tx.execute("INSERT INTO capture_deletions(storage_key,content_hash,identity,acknowledged) VALUES(?1,?2,?3,1)
+        ON CONFLICT(storage_key,content_hash) DO UPDATE SET acknowledged=1",
+        params![identity.storage_key(), hash, serde_json::to_string(identity).map_err(storage)?]).map_err(storage)?;
+    tx.execute(
+        "UPDATE deliveries SET cancelled=1,withdrawn=1 WHERE sequence=?1",
+        [sequence],
+    )
+    .map_err(storage)?;
+    Ok(())
 }
 
 impl CaptureOutbox {
@@ -182,9 +274,16 @@ impl CaptureOutbox {
             spool_sequence INTEGER NOT NULL,identity TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,receipt TEXT,
             UNIQUE(storage_key,spool_sequence));
             CREATE INDEX IF NOT EXISTS pending_deliveries ON deliveries(attempts,sequence) WHERE receipt IS NULL;
-            CREATE TABLE IF NOT EXISTS revision_leases(storage_key TEXT NOT NULL,content_hash TEXT NOT NULL,
-            owner TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(storage_key,content_hash));
             ").map_err(storage)?;
+        if version == 4 {
+            // Version 4 leases carried no fencing token; none can be live
+            // across this upgrade's exclusive transaction worth preserving.
+            tx.execute_batch("DROP TABLE IF EXISTS revision_leases;")
+                .map_err(storage)?;
+        }
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS revision_leases(storage_key TEXT NOT NULL,content_hash TEXT NOT NULL,
+            owner TEXT NOT NULL,expires_at INTEGER NOT NULL,token INTEGER NOT NULL,
+            PRIMARY KEY(storage_key,content_hash));").map_err(storage)?;
         if version < 2 {
             tx.execute_batch(
                 "ALTER TABLE deliveries ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0;
@@ -213,6 +312,8 @@ impl CaptureOutbox {
             )
             .map_err(storage)?;
         }
+        tx.execute_batch("PRAGMA user_version=5;")
+            .map_err(storage)?;
         tx.commit().map_err(storage)?;
         let destination = destination(client);
         db.execute(
@@ -235,6 +336,8 @@ impl CaptureOutbox {
             spool,
             destination,
             owner: owner_token(),
+            #[cfg(test)]
+            pause: None,
         })
     }
 
@@ -336,7 +439,7 @@ impl CaptureOutbox {
                         continue;
                     }
                 };
-            let Some(_lease) = self.lease(&identity.storage_key(), &hash)? else {
+            let Some(lease) = self.lease(&identity.storage_key(), &hash)? else {
                 result.busy += 1;
                 continue;
             };
@@ -347,18 +450,33 @@ impl CaptureOutbox {
                 self.set_delivery(sequence, "cancelled=1")?;
                 continue;
             }
-            match client.upload(&identity, &envelope).await {
+            self.checkpoint(1).await;
+            if !lease.renew()? {
+                result.fenced += 1;
+                continue;
+            }
+            let outcome = client.upload(&identity, &envelope).await;
+            self.checkpoint(2).await;
+            let Some(tx) = lease.commit()? else {
+                result.fenced += 1;
+                continue;
+            };
+            match outcome {
                 Ok(receipt) => {
-                    self.db.execute("UPDATE deliveries SET receipt=?2 WHERE sequence=?1 AND receipt IS NULL",
-                        params![sequence,serde_json::to_string(&receipt).map_err(storage)?]).map_err(storage)?;
+                    tx.execute(
+                        "UPDATE deliveries SET receipt=?2 WHERE sequence=?1 AND receipt IS NULL",
+                        params![sequence, serde_json::to_string(&receipt).map_err(storage)?],
+                    )
+                    .map_err(storage)?;
                     result.acknowledged += 1;
                 }
                 Err(CaptureUploadError::Status(410)) => {
-                    self.withdraw(sequence, &identity, &hash)?;
+                    withdraw(&tx, sequence, &identity, &hash)?;
                     result.withdrawn += 1;
                 }
                 Err(_) => result.failed += 1,
             }
+            tx.commit().map_err(storage)?;
         }
         result.integrity += self.cleanup(limit)?;
         (result.remaining, result.quarantined) = self
@@ -414,45 +532,46 @@ impl CaptureOutbox {
     }
 
     /// Take the revision's lease, or `None` while another holder's is live.
+    /// Every grant numbers itself one above the previous grant.
     fn lease(&self, key: &str, hash: &str) -> Result<Option<Lease<'_>>, CaptureOutboxError> {
         let now = now();
-        let taken = self
+        let token: Option<i64> = self
             .db
-            .execute(
-                "INSERT INTO revision_leases(storage_key,content_hash,owner,expires_at) VALUES(?1,?2,?3,?4)
+            .query_row(
+                "INSERT INTO revision_leases(storage_key,content_hash,owner,expires_at,token)
+                 VALUES(?1,?2,?3,?4,1)
                  ON CONFLICT(storage_key,content_hash) DO UPDATE SET owner=excluded.owner,
-                 expires_at=excluded.expires_at WHERE revision_leases.expires_at<=?5",
+                 expires_at=excluded.expires_at,token=revision_leases.token+1
+                 WHERE revision_leases.expires_at<=?5 RETURNING token",
                 params![key, hash, self.owner, now + LEASE_SECS, now],
+                |r| r.get(0),
             )
+            .optional()
             .map_err(storage)?;
-        Ok((taken == 1).then(|| Lease {
+        Ok(token.map(|token| Lease {
             db: &self.db,
             key: key.to_owned(),
             hash: hash.to_owned(),
             owner: &self.owner,
+            token,
         }))
     }
 
-    /// The store holds a tombstone for this revision. Record it as an
-    /// acknowledged local deletion, so it is never uploaded or re-enqueued,
-    /// and cleanup drops the queued body without sending a DELETE.
-    fn withdraw(
-        &self,
-        sequence: i64,
-        identity: &QualifiedTranscript,
-        hash: &str,
-    ) -> Result<(), CaptureOutboxError> {
-        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)
-            .map_err(storage)?;
-        tx.execute("INSERT INTO capture_deletions(storage_key,content_hash,identity,acknowledged) VALUES(?1,?2,?3,1)
-            ON CONFLICT(storage_key,content_hash) DO UPDATE SET acknowledged=1",
-            params![identity.storage_key(), hash, serde_json::to_string(identity).map_err(storage)?]).map_err(storage)?;
-        tx.execute(
-            "UPDATE deliveries SET cancelled=1,withdrawn=1 WHERE sequence=?1",
-            [sequence],
-        )
-        .map_err(storage)?;
-        tx.commit().map_err(storage)
+    /// Test seam: hold a drain at one point of a remote request. A no-op in
+    /// every build but this crate's own tests.
+    #[cfg(not(test))]
+    async fn checkpoint(&self, _stage: u8) {}
+
+    #[cfg(test)]
+    async fn checkpoint(&self, stage: u8) {
+        let wanted = match stage {
+            1 => Stage::BeforeSend,
+            _ => Stage::BeforeCommit,
+        };
+        if let Some(pause) = self.pause.as_ref().filter(|p| p.stage == wanted) {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
     }
 
     /// Returns the number of rows newly set aside for integrity. A corrupt
@@ -579,17 +698,31 @@ impl CaptureOutbox {
                     continue;
                 }
             };
-            let Some(_lease) = self.lease(&key, &hash)? else {
+            let Some(lease) = self.lease(&key, &hash)? else {
                 result.busy += 1;
                 continue;
             };
             attempted += 1;
-            if client.delete(&identity, &hash).await.is_ok() {
-                set("acknowledged=1")?;
+            if !lease.renew()? {
+                result.fenced += 1;
+                continue;
+            }
+            let sent = client.delete(&identity, &hash).await.is_ok();
+            let Some(tx) = lease.commit()? else {
+                result.fenced += 1;
+                continue;
+            };
+            if sent {
+                tx.execute(
+                    "UPDATE capture_deletions SET acknowledged=1 WHERE storage_key=?1 AND content_hash=?2",
+                    params![key, hash],
+                )
+                .map_err(storage)?;
                 result.deleted += 1;
             } else {
                 result.failed += 1;
             }
+            tx.commit().map_err(storage)?;
         }
         Ok(attempted)
     }
@@ -1048,6 +1181,153 @@ mod tests {
         assert_eq!(objects(root.path()), 0);
     }
 
+    /// Hold `outbox` at `stage` of its next remote request.
+    fn pause_at(
+        outbox: &mut CaptureOutbox,
+        stage: Stage,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        outbox.pause = Some(Pause {
+            stage,
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        (reached, resume)
+    }
+
+    /// Stand in for the holder's clock running past expiry (a suspended
+    /// process, or a jump): the lease becomes eligible for takeover.
+    fn expire_leases(outbox: &CaptureOutbox) {
+        outbox
+            .db
+            .execute("UPDATE revision_leases SET expires_at=0", [])
+            .unwrap();
+    }
+
+    fn delivery(outbox: &CaptureOutbox) -> (Option<String>, bool) {
+        outbox
+            .db
+            .query_row(
+                "SELECT receipt,cancelled FROM deliveries WHERE sequence=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_holder_paused_past_expiry_never_sends_after_the_takeover() {
+        let store = fake::start();
+        let client = QualifiedCaptureClient::new(&store.url, "token".into()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (identity, envelope) = (source("source"), capture("body\r\n"));
+        let hash = session_capture::content_hash_for(&envelope).unwrap();
+        let mut uploader = CaptureOutbox::open(root.path(), &client).unwrap();
+        uploader.enqueue(&identity, &envelope).unwrap();
+        let deleter = CaptureOutbox::open(root.path(), &client).unwrap();
+        let (reached, resume) = pause_at(&mut uploader, Stage::BeforeSend);
+        let upload = uploader.drain(&client, 1);
+        let script = async {
+            // Lease held, tombstone checked, request not yet sent.
+            reached.notified().await;
+            expire_leases(&deleter);
+            deleter.enqueue_deletion(&identity, &hash).unwrap();
+            let deleted = deleter.drain(&client, 1).await.unwrap();
+            assert_eq!((deleted.deleted, deleted.busy), (1, 0));
+            resume.notify_one();
+        };
+        let (stale, ()) = tokio::join!(upload, script);
+        let stale = stale.unwrap();
+        assert_eq!((stale.fenced, stale.acknowledged, stale.failed), (1, 0, 0));
+        assert_eq!(store.state.lock().unwrap().log, ["deleted"]);
+        // No receipt; the deleter's cleanup already cancelled the row and
+        // erased its body.
+        assert_eq!(delivery(&uploader), (None, true));
+        assert_eq!(objects(root.path()), 0);
+        uploader.pause = None;
+        let next = uploader.drain(&client, 2).await.unwrap();
+        assert_eq!((next.acknowledged, next.remaining, next.fenced), (0, 0, 0));
+        assert_eq!(delivery(&uploader), (None, true));
+        assert_eq!(store.state.lock().unwrap().log, ["deleted"]);
+        assert!(!fake::served(&store.url, &identity).await);
+    }
+
+    #[tokio::test]
+    async fn a_holder_paused_past_expiry_never_commits_after_the_takeover() {
+        let store = fake::start();
+        let client = QualifiedCaptureClient::new(&store.url, "token".into()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (identity, envelope) = (source("source"), capture("body\r\n"));
+        let hash = session_capture::content_hash_for(&envelope).unwrap();
+        let mut uploader = CaptureOutbox::open(root.path(), &client).unwrap();
+        uploader.enqueue(&identity, &envelope).unwrap();
+        let deleter = CaptureOutbox::open(root.path(), &client).unwrap();
+        let (reached, resume) = pause_at(&mut uploader, Stage::BeforeCommit);
+        let upload = uploader.drain(&client, 1);
+        let script = async {
+            // The upload landed; its receipt is not yet recorded.
+            reached.notified().await;
+            expire_leases(&deleter);
+            deleter.enqueue_deletion(&identity, &hash).unwrap();
+            assert_eq!(deleter.drain(&client, 1).await.unwrap().deleted, 1);
+            resume.notify_one();
+        };
+        let (stale, ()) = tokio::join!(upload, script);
+        let stale = stale.unwrap();
+        assert_eq!((stale.fenced, stale.acknowledged), (1, 0));
+        assert_eq!(store.state.lock().unwrap().log, ["stored", "deleted"]);
+        // No receipt; the deleter's cleanup already cancelled the row and
+        // erased its body.
+        assert_eq!(delivery(&uploader), (None, true));
+        assert_eq!(objects(root.path()), 0);
+        assert!(uploader.receipt(&identity, &hash).unwrap().is_none());
+        uploader.pause = None;
+        let next = uploader.drain(&client, 2).await.unwrap();
+        assert_eq!((next.acknowledged, next.remaining), (0, 0));
+        assert_eq!(delivery(&uploader), (None, true));
+        assert_eq!(store.state.lock().unwrap().log, ["stored", "deleted"]);
+        assert!(!fake::served(&store.url, &identity).await);
+    }
+
+    #[tokio::test]
+    async fn a_superseded_grant_can_neither_renew_commit_nor_release() {
+        let store = fake::start();
+        let client = QualifiedCaptureClient::new(&store.url, "token".into()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let identity = source("source");
+        let hash = session_capture::content_hash_for(&capture("gone")).unwrap();
+        let first = CaptureOutbox::open(root.path(), &client).unwrap();
+        first.enqueue_deletion(&identity, &hash).unwrap();
+        let second = CaptureOutbox::open(root.path(), &client).unwrap();
+        // Take the lease over while the first holder's grant is outstanding.
+        let lease = first
+            .lease(&identity.storage_key(), &hash)
+            .unwrap()
+            .unwrap();
+        expire_leases(&second);
+        let taken = second
+            .lease(&identity.storage_key(), &hash)
+            .unwrap()
+            .unwrap();
+        assert!(taken.token > lease.token);
+        assert!(!lease.renew().unwrap());
+        assert!(lease.commit().unwrap().is_none());
+        assert!(taken.renew().unwrap());
+        drop(lease);
+        // Dropping the stale grant does not release the current one.
+        assert!(first
+            .lease(&identity.storage_key(), &hash)
+            .unwrap()
+            .is_none());
+        drop(taken);
+        assert_eq!(first.drain(&client, 1).await.unwrap().deleted, 1);
+        assert_eq!(store.state.lock().unwrap().log, ["deleted"]);
+    }
+
     #[tokio::test]
     async fn gone_is_terminal_withdrawal_that_drops_the_body_without_a_delete() {
         let store = fake::start();
@@ -1068,7 +1348,7 @@ mod tests {
         queue
             .db
             .execute(
-                "INSERT INTO revision_leases VALUES(?1,?2,'dead',0)",
+                "INSERT INTO revision_leases VALUES(?1,?2,'dead',0,7)",
                 params![identity.storage_key(), hash],
             )
             .unwrap();

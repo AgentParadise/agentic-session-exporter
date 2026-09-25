@@ -13,12 +13,17 @@ The command performs one discovery sweep and writes a JSON summary to stdout.
 Oversized envelopes are counted and cause exit status 3. A successful sweep
 does not prove every expected session was discovered or finished.
 
-Discovery streams: Claude and Codex transcripts are read, archived, and dropped
-one at a time, and a source file larger than `MAX_ENVELOPE_BYTES` is counted as
-oversize without being read. Each envelope is serialized once, straight to its
-object file, and abandoned if it grows past the bound. Peak memory is therefore
-one transcript, not the corpus. Cursor threads still come from one bounded
-database query (`CURSOR_LIMIT`).
+Discovery streams: directories are walked without buffering their listings, and
+Claude and Codex transcripts are read, archived, and dropped one at a time. A
+source file larger than `MAX_ENVELOPE_BYTES` is counted as oversize without being
+read. Cursor threads are streamed newest first: one pass reads only each
+composer row's size and creation time, keeping at most 100,000 candidates, and a
+second assembles one thread at a time. A thread whose composer and bubble rows
+exceed `MAX_ENVELOPE_BYTES` is counted as oversize before it is assembled, and
+threads left out by the count bound are reported as `skipped_overflow`. Each
+envelope is serialized once, straight to its object file, and abandoned if it
+grows past the bound. Peak memory is therefore one transcript, not the corpus.
+Oversize or overflow causes exit status 3.
 
 ## Trusted root
 

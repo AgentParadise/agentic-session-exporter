@@ -253,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Spool => {
             let summary = agentic_session_exporter::spool::capture_local(&cfg, &spool_root()?)?;
             println!("{}", serde_json::to_string(&summary)?);
-            if summary.skipped_oversize > 0 {
+            if summary.skipped_oversize > 0 || summary.skipped_overflow > 0 {
                 std::process::exit(EXIT_INCOMPLETE);
             }
         }

@@ -52,7 +52,7 @@ The envelope follows APS-V1-0004. Input is limited to 64 MiB. Success emits
 retry emits `inserted:false`.
 
 `apss-session-exporter --capture-drain N` attempts 1 to 50 queued captures and
-emits `acknowledged`, `failed`, `remaining`, `deleted`, `withdrawn`, `busy`,
+emits `acknowledged`, `failed`, `remaining`, `deleted`, `withdrawn`, `fenced`, `busy`,
 `integrity`, and `quarantined` counts. Exit 0 means no pending work remains and
 nothing is quarantined; exit 3 means pending work remains or a row is
 quarantined. Invalid flags exit 2. Operational
@@ -91,6 +91,15 @@ pass and reports it as `busy`; it stays pending. A lease expires after five
 minutes, far beyond the 30 second request timeout, so a holder that died
 releases it unattended.
 
+Leases are fenced. Every grant of a revision's lease carries a token one above
+the previous grant, and the holder re-proves it holds that exact token, renewing
+the lease, immediately before sending, and again inside the transaction that
+records the result. Wall-clock time only decides when an abandoned lease may be
+taken over, never who may act. A holder paused or clock-jumped past expiry whose
+lease was taken over neither sends nor records anything: it reports `fenced`
+and the row stays pending for a later pass. The store's tombstone check remains
+the backstop for a request already on the wire when that happens.
+
 The store is the final authority. A store's 410 upload response means it holds a
 tombstone for that revision: the upload is `withdrawn`, which is terminal. It is
 never retried, the queued body is dropped, and no DELETE is sent because the
@@ -103,7 +112,7 @@ repair it, so it is set aside with its identity and never retried, and the pass
 continues with unrelated work. `quarantined` reports the total set aside, by
 identity only, never transcript content. A failure of the spool as a whole, such
 as its object directory being replaced, is `failed` and retried instead. SQLite
-schema version 4 preserves existing deliveries during upgrade.
+schema version 5 preserves existing deliveries during upgrade.
 
 This prevents queued transmission and remote resurrection once the store accepts
 the tombstone. Drain also removes deleted envelope files from the outbox spool,

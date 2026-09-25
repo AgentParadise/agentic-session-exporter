@@ -120,6 +120,9 @@ pub struct SpoolSummary {
     pub stored: usize,
     pub duplicate: usize,
     pub skipped_oversize: usize,
+    /// Sources left out by a count bound. Never zero by accident: a sweep
+    /// that truncated anything reports it here and exits incomplete.
+    pub skipped_overflow: usize,
     pub watermark: u64,
 }
 
@@ -383,11 +386,19 @@ pub fn capture_local(cfg: &Config, root: &Path) -> Result<SpoolSummary, SpoolErr
     };
     let limit = cfg.max_envelope_bytes;
     crate::visit_all(cfg, limit as u64, &mut |found| {
-        summary.discovered += 1;
-        let Found::Transcript(source) = found else {
-            summary.skipped_oversize += 1;
-            return Ok(());
+        let source = match found {
+            Found::Transcript(source) => source,
+            Found::Oversize(_) => {
+                summary.discovered += 1;
+                summary.skipped_oversize += 1;
+                return Ok(());
+            }
+            Found::Overflow(count) => {
+                summary.skipped_overflow += count as usize;
+                return Ok(());
+            }
         };
+        summary.discovered += 1;
         match spool.store_bounded(&source.envelope, limit)? {
             None => summary.skipped_oversize += 1,
             Some((_, true)) => summary.stored += 1,
