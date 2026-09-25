@@ -26,7 +26,7 @@ pub enum ParseError {
     Empty,
     #[error("could not determine session id from transcript")]
     NoSessionId,
-    #[error("Claude JSONL transcript is not valid UTF-8, so it cannot be preserved as an SCS raw string")]
+    #[error("JSONL transcript is not valid UTF-8, so it cannot be preserved as an SCS raw string")]
     InvalidUtf8,
 }
 
@@ -145,12 +145,14 @@ pub fn read_codex(
     fallback_id: &str,
     origin: Origin,
 ) -> Result<SessionEnvelope, ParseError> {
-    let rows = parse_rows(bytes);
+    let raw = String::from_utf8(bytes.to_vec()).map_err(|_| ParseError::InvalidUtf8)?;
+    let rows = parse_rows(raw.as_bytes());
     if rows.is_empty() {
         return Err(ParseError::Empty);
     }
 
     let mut session_id = fallback_id.to_string();
+    let mut saw_header = false;
     let mut meta = Metadata::default();
     let mut message_count: u64 = 0;
     let mut first_ts: Option<DateTime<Utc>> = None;
@@ -164,7 +166,9 @@ pub fn read_codex(
             }
         }
         match row.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-            "session_meta" => {
+            "session_meta" if !saw_header => {
+                // Forked histories can repeat ancestor headers after this one.
+                saw_header = true;
                 if let Some(payload) = row.get("payload") {
                     if let Some(id) = payload.get("id").and_then(|x| x.as_str()) {
                         if !id.is_empty() {
@@ -207,7 +211,7 @@ pub fn read_codex(
         last_activity_at,
         content_hash: None,
         metadata: Some(meta),
-        raw: Value::Array(rows),
+        raw: Value::String(raw),
     })
 }
 
@@ -375,6 +379,23 @@ mod tests {
     }
 
     #[test]
+    fn codex_preserves_child_identity_before_inherited_parent_header() {
+        let raw = concat!(
+            r#"{"type":"session_meta","payload":{"id":"child","session_id":"root","multi_agent_version":"v2","cwd":"/child"}}"#,
+            "\n",
+            r#"{"type":"session_meta","payload":{"id":"root","cwd":"/parent"}}"#,
+            "\n"
+        );
+        let env = read_codex(raw.as_bytes(), "fallback", origin()).unwrap();
+        assert_eq!(env.session_id, "child");
+        assert_eq!(
+            env.metadata.as_ref().unwrap().cwd.as_deref(),
+            Some("/child")
+        );
+        assert_eq!(env.raw.as_str().unwrap(), raw);
+    }
+
+    #[test]
     fn codex_prefers_session_meta_id() {
         let jsonl = concat!(
             r#"{"type":"session_meta","timestamp":"2026-07-01T00:00:00Z","payload":{"id":"real-id","cwd":"/c","model_provider":"openai"}}"#,
@@ -389,7 +410,7 @@ mod tests {
         assert_eq!(metadata.cwd.as_deref(), Some("/c"));
         assert_eq!(metadata.model.as_deref(), Some("openai"));
         assert_eq!(metadata.message_count, Some(1));
-        assert_eq!(env.raw.as_array().unwrap().len(), 2);
+        assert_eq!(env.raw.as_str(), Some(jsonl));
     }
 
     #[test]
@@ -413,6 +434,17 @@ mod tests {
         let jsonl = r#"{"type":"user","message":{"role":"user","content":"hi"}}"#;
         let err = read_claude(jsonl.as_bytes(), "   ", origin()).unwrap_err();
         assert_eq!(parse_err_kind(&err), "no-session-id");
+    }
+
+    #[test]
+    fn codex_preserves_original_bytes_and_rejects_invalid_utf8() {
+        let raw = b"{ \"type\": \"session_meta\", \"payload\": {\"id\":\"native\"} }\r\nmalformed line\r\n\r\n";
+        let envelope = read_codex(raw, "fallback", origin()).unwrap();
+        assert_eq!(envelope.raw.as_str().unwrap().as_bytes(), raw);
+        assert!(matches!(
+            read_codex(b"\xff", "fallback", origin()),
+            Err(ParseError::InvalidUtf8)
+        ));
     }
 
     #[test]

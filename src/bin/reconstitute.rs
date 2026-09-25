@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use agentic_session_exporter::reconstitute::{
-    invoke_claude_resume, ReconstitutionClient, ReconstitutionLocations,
+    invoke_claude_resume, reconstitute_qualified, ReconstitutionClient, ReconstitutionLocations,
 };
 use session_capture::SCS_VERSION;
 
@@ -62,8 +62,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         locations.repos_root = repos_root;
     }
 
-    let client = ReconstitutionClient::new(&store_url, read_token);
-    let plan = client.reconstitute(&args.session_id, &locations).await?;
+    let plan = if let (Some(source), Some(harness)) = (args.source_instance_id, args.harness) {
+        let identity =
+            session_capture::inventory::QualifiedTranscript::new(source, harness, args.session_id)?;
+        let reader = agentic_session_exporter::qualified_capture::QualifiedCaptureReader::new(
+            &store_url,
+            read_token.ok_or("SESSIONS_READ_TOKEN is required for qualified restore")?,
+            std::env::var("SESSIONS_RAW_READ_TOKEN")?,
+        )?;
+        reconstitute_qualified(&reader, &identity, &locations).await?
+    } else {
+        ReconstitutionClient::new(&store_url, read_token)
+            .reconstitute(&args.session_id, &locations)
+            .await?
+    };
     println!(
         "restored session={} repo={} cwd={} transcript={}",
         plan.session_id,
@@ -93,6 +105,8 @@ struct Arguments {
     session_id: String,
     repos_root: Option<PathBuf>,
     no_resume: bool,
+    source_instance_id: Option<String>,
+    harness: Option<String>,
 }
 
 /// A usage error. Always reported on stderr and always exit code 2.
@@ -102,6 +116,7 @@ enum ArgError {
     MissingValue(&'static str),
     UnexpectedArgument(String),
     MissingSessionId,
+    IncompleteIdentity,
 }
 
 impl std::fmt::Display for ArgError {
@@ -110,6 +125,10 @@ impl std::fmt::Display for ArgError {
             Self::UnknownFlag(flag) => write!(f, "unknown option: {flag}"),
             Self::MissingValue(flag) => write!(f, "{flag} requires a value"),
             Self::UnexpectedArgument(arg) => write!(f, "unexpected argument: {arg}"),
+            Self::IncompleteIdentity => write!(
+                f,
+                "--source-instance-id and --harness must be supplied together"
+            ),
             Self::MissingSessionId => write!(f, "session id is required"),
         }
     }
@@ -125,6 +144,8 @@ fn parse_args(args: &[String]) -> Result<Command, ArgError> {
     let mut session_id: Option<String> = None;
     let mut repos_root: Option<PathBuf> = None;
     let mut no_resume = false;
+    let mut source_instance_id = None;
+    let mut harness = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -136,6 +157,26 @@ fn parse_args(args: &[String]) -> Result<Command, ArgError> {
                     .get(index + 1)
                     .ok_or(ArgError::MissingValue("--repos-root"))?;
                 repos_root = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--source-instance-id" | "--harness" => {
+                let flag = if args[index] == "--harness" {
+                    "--harness"
+                } else {
+                    "--source-instance-id"
+                };
+                let value = args
+                    .get(index + 1)
+                    .filter(|v| !v.starts_with('-') && !v.trim().is_empty())
+                    .ok_or(ArgError::MissingValue(flag))?;
+                let slot = if flag == "--harness" {
+                    &mut harness
+                } else {
+                    &mut source_instance_id
+                };
+                if slot.replace(value.clone()).is_some() {
+                    return Err(ArgError::UnexpectedArgument(flag.into()));
+                }
                 index += 2;
             }
             "--no-resume" => {
@@ -153,10 +194,15 @@ fn parse_args(args: &[String]) -> Result<Command, ArgError> {
         }
     }
 
+    if source_instance_id.is_some() != harness.is_some() {
+        return Err(ArgError::IncompleteIdentity);
+    }
     Ok(Command::Restore(Arguments {
         session_id: session_id.ok_or(ArgError::MissingSessionId)?,
         repos_root,
         no_resume,
+        source_instance_id,
+        harness,
     }))
 }
 
@@ -169,12 +215,15 @@ Usage: {bin} SESSION_ID [--repos-root PATH] [--no-resume]
        {bin} [--version | --help]
 
 Options:
+  --source-instance-id ID  source installation for qualified restore.
+  --harness NAME     harness namespace; requires --source-instance-id.
   --repos-root PATH  clone/lookup root for the session's repository.
   --no-resume        restore the files but do not launch `claude --resume`.
   --version, -V      print the version and exit.
   --help, -h         print this help and exit.
 
 Requires SESSION_STORE_URL; SESSIONS_READ_TOKEN is used when the store requires it.
+Qualified restore requires SESSIONS_READ_TOKEN and SESSIONS_RAW_READ_TOKEN.
 Restores ClaudeCode/claude-code-jsonl only. Missing repositories are cloned to
 RECONSTITUTION_REPOS_ROOT/<metadata.repo> (default: ~/Code/<metadata.repo>),
 then Claude's target-machine container path is recomputed and claude --resume runs.
@@ -198,6 +247,33 @@ mod tests {
             Command::Restore(args) => args,
             other => panic!("expected a restore command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn qualified_identity_requires_both_unique_flags() {
+        let args = restore(&[
+            "native",
+            "--source-instance-id",
+            "source",
+            "--harness",
+            "claude",
+        ]);
+        assert_eq!(args.source_instance_id.as_deref(), Some("source"));
+        assert_eq!(args.harness.as_deref(), Some("claude"));
+        assert_eq!(
+            parse(&["native", "--harness", "claude"]),
+            Err(ArgError::IncompleteIdentity)
+        );
+        assert_eq!(
+            parse(&["native", "--source-instance-id", "source"]),
+            Err(ArgError::IncompleteIdentity)
+        );
+        assert!(parse(&["native", "--harness", "--no-resume"]).is_err());
+        assert!(parse(&["native", "--harness", "claude", "--harness", "codex"]).is_err());
+        assert_eq!(
+            parse(&["--source-instance-id", "source", "--help"]),
+            Ok(Command::Help)
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ dependencies = [
  "chrono",
  "reqwest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -54,9 +55,8 @@ dependencies = [
 
 [[package]]
 name = "apss-core"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f838afff84260768b2d87b7d633293b59252c9f533f94e716fc137f90a85642e"
+version = "1.6.0"
+source = "git+https://github.com/AgentParadise/agent-paradise-standards-system.git?rev=d8924a557cfb114534f4cdb69ed1535f0eec4c8f#d8924a557cfb114534f4cdb69ed1535f0eec4c8f"
 dependencies = [
  "handlebars",
  "semver",
@@ -70,9 +70,8 @@ dependencies = [
 
 [[package]]
 name = "apss-v1-0004-session-capture"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a4d50ea7957eaf6c0fb8e712396381938da47985516a999d5e161c2d96abdf6"
+version = "2.1.0"
+source = "git+https://github.com/AgentParadise/agent-paradise-standards-system.git?rev=d8924a557cfb114534f4cdb69ed1535f0eec4c8f#d8924a557cfb114534f4cdb69ed1535f0eec4c8f"
 dependencies = [
  "apss-core",
  "regex",
