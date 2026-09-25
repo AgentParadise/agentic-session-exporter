@@ -404,9 +404,11 @@ Inventory replication (always emits JSON):
   --envelope-hash     validate and hash an envelope on stdin without configuration or storage.
   --capture-delete    durably queue exact qualified revision deletion from stdin (at most 16 KiB).
   --capture-receipt   look up a committed receipt for the qualified envelope on stdin.
-  --capture-drain N   retry at most N qualified captures (1..50); exit 3 if any remain.
+  --capture-drain N   retry at most N qualified captures (1..50); exit 3 if any remain
+                      or any are quarantined.
   --inventory-enqueue accept one operation JSON from stdin (at most 2 MiB).
-  --inventory-drain N retry at most N pending operations (1..500); exit 3 if any remain.
+  --inventory-drain N retry at most N pending operations (1..500); exit 3 if any remain
+                      or any are quarantined.
 Requires SESSION_STORE_URL, INVENTORY_WRITE_TOKEN and absolute EXPORTER_INVENTORY_DIR.
 Enqueue persists locally without network access. Drain is separate from capture.
 
@@ -895,7 +897,9 @@ async fn run_capture_delivery(command: Command) -> Result<(), Box<dyn std::error
         Command::CaptureDrain(limit) => {
             let summary = outbox.drain(&client, limit).await?;
             println!("{}", serde_json::to_string(&summary)?);
-            if summary.remaining > 0 {
+            // Quarantined rows will never deliver on their own, so a pass that
+            // leaves any behind is incomplete even with nothing else pending.
+            if summary.remaining > 0 || summary.quarantined > 0 {
                 std::process::exit(EXIT_INCOMPLETE);
             }
         }
@@ -949,7 +953,9 @@ async fn run_inventory(command: Command) -> Result<(), Box<dyn std::error::Error
         Command::InventoryDrain(limit) => {
             let summary = outbox.drain(&client, limit).await?;
             println!("{}", serde_json::to_string(&summary)?);
-            if summary.remaining > 0 {
+            // Quarantined rows will never deliver on their own, so a pass that
+            // leaves any behind is incomplete even with nothing else pending.
+            if summary.remaining > 0 || summary.quarantined > 0 {
                 std::process::exit(EXIT_INCOMPLETE);
             }
         }

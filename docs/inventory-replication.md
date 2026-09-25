@@ -18,9 +18,12 @@ Replaying the same identity and payload returns `inserted:false`; conflicting
 content fails without overwriting the prior operation.
 
 Call `apss-session-exporter --inventory-drain 100` to attempt at most 100 pending
-operations. The JSON result reports `acknowledged`, `pending`, `failed`, and the
-remaining queue count. Exit 3 means some work remains, including work outside
-this bounded pass. Schedule another pass with backoff. Exit 0 means the local
+operations. The JSON result reports `acknowledged`, `pending`, `failed`, the
+remaining queue count, and `quarantined`. A queued payload that no longer
+decodes is quarantined with its identity rather than aborting the pass, so the
+operations behind it still deliver; `quarantined` is the total set aside. Exit 3
+means some work remains, including work outside this bounded pass, or a row is
+quarantined. Schedule another pass with backoff. Exit 0 means the local
 queue was empty at the final count, not that independent workflow capture is
 complete.
 

@@ -4,9 +4,8 @@
 //! after the object and directory are durable. An interrupted object write may
 //! leave an unreferenced object; it can never publish a missing acknowledged body.
 
-use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -14,8 +13,11 @@ use serde::{Deserialize, Serialize};
 use session_capture::SessionEnvelope;
 use sha2::{Digest, Sha256};
 
-use crate::{config::Config, discover_all};
+use crate::config::Config;
+use crate::secure_fs::{sqlite_flags, SecureDir};
+use crate::sources::{Found, VisitError};
 
+const DATABASE: &str = "inventory.sqlite3";
 pub const SPOOL_SCHEMA_VERSION: u32 = 1;
 const MAX_PAGE: usize = 500;
 
@@ -37,6 +39,60 @@ pub enum SpoolError {
     Bounds,
     #[error("local spool revision does not exist")]
     NotFound,
+    #[error("local spool directory was replaced or is not trusted")]
+    Untrusted,
+}
+
+impl SpoolError {
+    /// True when this revision's own stored bytes or index row are unusable,
+    /// as opposed to the spool as a whole failing (storage, trust, schema).
+    /// Retrying an integrity failure cannot succeed; retrying the rest can.
+    pub fn is_integrity(&self) -> bool {
+        match self {
+            Self::Integrity | Self::NotFound | Self::Json(_) => true,
+            Self::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+            ),
+            _ => false,
+        }
+    }
+}
+
+impl From<VisitError<SpoolError>> for SpoolError {
+    fn from(error: VisitError<SpoolError>) -> Self {
+        match error {
+            VisitError::Source(error) => Self::Source(error),
+            VisitError::Visitor(error) => error,
+        }
+    }
+}
+
+/// Counts and hashes serialized bytes on their way to disk, refusing to write
+/// past `limit`, so an envelope is serialized exactly once and never held
+/// whole in memory.
+struct BoundedHasher<W: Write> {
+    inner: W,
+    hasher: Sha256,
+    written: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl<W: Write> Write for BoundedHasher<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written.saturating_add(buf.len()) > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other("envelope exceeds the size bound"));
+        }
+        let count = self.inner.write(buf)?;
+        self.hasher.update(&buf[..count]);
+        self.written += count;
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,15 +124,21 @@ pub struct SpoolSummary {
 }
 
 pub struct LocalSpool {
-    root: PathBuf,
+    dir: SecureDir,
+    objects: SecureDir,
     db: Connection,
 }
 
 impl LocalSpool {
     pub fn open(root: &Path) -> Result<Self, SpoolError> {
-        private_directory(root)?;
-        private_directory(&root.join("objects"))?;
-        let db = Connection::open(root.join("inventory.sqlite3"))?;
+        Self::open_in(SecureDir::open_root(root, true)?)
+    }
+
+    /// Open a spool in a directory already verified beneath a trusted root.
+    pub(crate) fn open_in(dir: SecureDir) -> Result<Self, SpoolError> {
+        let objects = dir.child("objects", true)?;
+        let db = Connection::open_with_flags(dir.sqlite_path(DATABASE)?, sqlite_flags(false))?;
+        dir.verify()?;
         db.busy_timeout(Duration::from_secs(30))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -93,54 +155,84 @@ impl LocalSpool {
              );
              PRAGMA user_version=1;",
         )?;
-        sync_directory(root)?;
-        Ok(Self {
-            root: root.to_owned(),
-            db,
-        })
+        dir.sync()?;
+        Ok(Self { dir, objects, db })
     }
 
     pub fn open_readonly(root: &Path) -> Result<Self, SpoolError> {
-        let db = Connection::open_with_flags(
-            root.join("inventory.sqlite3"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let dir = SecureDir::open_root(root, false)?;
+        let objects = dir.child("objects", false)?;
+        let db = Connection::open_with_flags(dir.sqlite_path(DATABASE)?, sqlite_flags(true))?;
+        dir.verify()?;
         db.busy_timeout(Duration::from_secs(30))?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version != SPOOL_SCHEMA_VERSION {
             return Err(SpoolError::Schema);
         }
-        Ok(Self {
-            root: root.to_owned(),
-            db,
-        })
+        Ok(Self { dir, objects, db })
+    }
+
+    /// Every access re-proves that the root and object directory are the
+    /// ones opened, so a component replaced after open fails closed.
+    fn guard(&self) -> Result<(), SpoolError> {
+        self.dir
+            .verify()
+            .and_then(|()| self.objects.verify())
+            .map_err(|_| SpoolError::Untrusted)
     }
 
     pub fn store(&mut self, envelope: &SessionEnvelope) -> Result<(SpoolEntry, bool), SpoolError> {
-        let bytes = serde_json::to_vec(envelope)?;
-        let digest = format!("{:x}", Sha256::digest(&bytes));
-        let directory = self.root.join("objects");
-        let target = directory.join(&digest);
-        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
-        temporary.write_all(&bytes)?;
-        temporary.as_file().sync_all()?;
-        match temporary.persist_noclobber(&target) {
-            Ok(_) => {}
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if read_bounded(&target, bytes.len())? != bytes {
-                    return Err(SpoolError::Integrity);
-                }
-            }
-            Err(error) => return Err(SpoolError::Io(error.error)),
+        self.store_bounded(envelope, usize::MAX)?
+            .ok_or(SpoolError::Integrity)
+    }
+
+    /// Serialize once, straight to a private temporary object, hashing as it
+    /// goes. Returns `None`, leaving nothing behind, when the serialized
+    /// envelope would exceed `max_bytes`.
+    pub fn store_bounded(
+        &mut self,
+        envelope: &SessionEnvelope,
+        max_bytes: usize,
+    ) -> Result<Option<(SpoolEntry, bool)>, SpoolError> {
+        self.guard()?;
+        let mut temporary = self.objects.create_temp()?;
+        let mut writer = BoundedHasher {
+            inner: std::io::BufWriter::new(temporary.file().try_clone()?),
+            hasher: Sha256::new(),
+            written: 0,
+            limit: max_bytes,
+            exceeded: false,
+        };
+        if let Err(error) = serde_json::to_writer(&mut writer, envelope) {
+            return if writer.exceeded {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
         }
-        sync_directory(&directory)?;
+        writer.flush()?;
+        let BoundedHasher {
+            inner,
+            hasher,
+            written: byte_count,
+            ..
+        } = writer;
+        drop(inner);
+        let digest = format!("{:x}", hasher.finalize());
+        temporary.file().sync_all()?;
+        if !temporary.publish_noclobber(&digest)? && self.digest_of(&digest, byte_count)? != digest
+        {
+            return Err(SpoolError::Integrity);
+        }
+        drop(temporary);
+        self.objects.sync()?;
         let tx = self.db.transaction()?;
         let inserted = tx.execute(
             "INSERT INTO envelope_revisions (archive_sha256,byte_count,agent,native_session_id)
              VALUES (?1,?2,?3,?4) ON CONFLICT(archive_sha256) DO NOTHING",
             params![
                 digest,
-                bytes.len() as u64,
+                byte_count as u64,
                 envelope.agent,
                 envelope.session_id
             ],
@@ -152,12 +244,33 @@ impl LocalSpool {
             entry_from_row,
         )?;
         tx.commit()?;
-        Ok((entry, inserted))
+        Ok(Some((entry, inserted)))
+    }
+
+    /// Stream-hash an existing object, refusing one longer than expected.
+    fn digest_of(&self, name: &str, expected: usize) -> Result<String, SpoolError> {
+        let mut reader = self.objects.open_read(name)?.take(expected as u64 + 1);
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0; 64 * 1024];
+        let mut total = 0;
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            total += count;
+        }
+        if total != expected {
+            return Err(SpoolError::Integrity);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     /// The owning outbox must serialize this with its writers and prove that
     /// no undelivered identity still requires these bytes. Metadata is retained.
     pub(crate) fn discard_body(&self, sequence: u64) -> Result<(), SpoolError> {
+        self.guard()?;
         let digest: String = self.db.query_row(
             "SELECT archive_sha256 FROM envelope_revisions WHERE sequence=?1",
             [sequence],
@@ -170,13 +283,8 @@ impl LocalSpool {
         {
             return Err(SpoolError::Integrity);
         }
-        let directory = self.root.join("objects");
-        match fs::remove_file(directory.join(digest)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(SpoolError::Io(error)),
-        }
-        sync_directory(&directory)?;
+        self.objects.remove(&digest)?;
+        self.objects.sync()?;
         Ok(())
     }
 
@@ -223,6 +331,7 @@ impl LocalSpool {
     }
 
     pub fn read(&self, sequence: u64, max_bytes: usize) -> Result<Vec<u8>, SpoolError> {
+        self.guard()?;
         let entry = self
             .db
             .query_row(
@@ -239,12 +348,12 @@ impl LocalSpool {
         {
             return Err(SpoolError::Integrity);
         }
-        let path = self.root.join("objects").join(&entry.archive_sha256);
-        let metadata = fs::symlink_metadata(&path)?;
-        if !metadata.is_file() || metadata.len() != entry.byte_count {
+        let file = self.objects.open_read(&entry.archive_sha256)?;
+        if file.metadata()?.len() != entry.byte_count {
             return Err(SpoolError::Integrity);
         }
-        let bytes = read_bounded(&path, max_bytes)?;
+        let mut bytes = Vec::new();
+        file.take(entry.byte_count + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 != entry.byte_count
             || format!("{:x}", Sha256::digest(&bytes)) != entry.archive_sha256
         {
@@ -252,17 +361,6 @@ impl LocalSpool {
         }
         Ok(bytes)
     }
-}
-
-fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, SpoolError> {
-    let file = File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(SpoolError::Integrity);
-    }
-    Ok(bytes)
 }
 
 fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpoolEntry> {
@@ -275,45 +373,28 @@ fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpoolEntry> {
     })
 }
 
-pub(crate) fn private_directory(path: &Path) -> std::io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)
-}
-
-pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    File::open(path)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = path; // SQLite FULL and the flushed object file provide the portable barrier.
-    Ok(())
-}
-
+/// Archive one sweep. Sources are read one at a time and each source file is
+/// bounded before allocation, so peak memory is one transcript, not the corpus.
 pub fn capture_local(cfg: &Config, root: &Path) -> Result<SpoolSummary, SpoolError> {
     let mut spool = LocalSpool::open(root)?;
-    let discovered = discover_all(cfg)?;
     let mut summary = SpoolSummary {
         schema_version: SPOOL_SCHEMA_VERSION,
-        discovered: discovered.len(),
         ..Default::default()
     };
-    for source in discovered {
-        if serde_json::to_vec(&source.envelope)?.len() > cfg.max_envelope_bytes {
+    let limit = cfg.max_envelope_bytes;
+    crate::visit_all(cfg, limit as u64, &mut |found| {
+        summary.discovered += 1;
+        let Found::Transcript(source) = found else {
             summary.skipped_oversize += 1;
-            continue;
+            return Ok(());
+        };
+        match spool.store_bounded(&source.envelope, limit)? {
+            None => summary.skipped_oversize += 1,
+            Some((_, true)) => summary.stored += 1,
+            Some((_, false)) => summary.duplicate += 1,
         }
-        let (_, inserted) = spool.store(&source.envelope)?;
-        if inserted {
-            summary.stored += 1;
-        } else {
-            summary.duplicate += 1;
-        }
-    }
+        Ok::<(), SpoolError>(())
+    })?;
     summary.watermark = spool.watermark()?;
     Ok(summary)
 }

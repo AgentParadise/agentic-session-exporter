@@ -38,31 +38,119 @@ pub enum SourceError {
     Cursor(#[from] crate::cursor::CursorError),
 }
 
-/// Cheap change-detection token for a discovered file. The success path is
-/// measured (a real file's metadata + mtime + len); the only cold spot is the
-/// metadata `?`/None arm, reachable solely under a mid-sweep unlink race, which
-/// the `?` propagation leaves as a covered region (no separate dead source line).
-fn fingerprint(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
+/// Cheap change-detection token for an opened file: `<mtime_secs>:<size>`.
+fn fingerprint_of(meta: &std::fs::Metadata) -> String {
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    Some(format!("{mtime}:{}", meta.len()))
+    format!("{mtime}:{}", meta.len())
 }
 
-/// Read a discovered transcript's change fingerprint and bytes together.
-/// Returns `None` (so the caller skips the file) when the file vanished or
-/// became unreadable between the directory walk and this read. Measured: the
-/// happy path is driven by the discover tests and the read-failure `None` path by
-/// the unreadable-file test; the fingerprint-miss `?` arm is an un-forceable
-/// unlink race that `?` leaves as a covered region.
-fn read_transcript(path: &Path) -> Option<(String, Vec<u8>)> {
-    let fp = fingerprint(path)?;
-    let bytes = std::fs::read(path).ok()?;
-    Some((fp, bytes))
+/// What reading one transcript produced.
+enum Transcript {
+    Bytes(String, Vec<u8>),
+    /// Larger than the caller's bound. Nothing beyond the bound was allocated.
+    Oversize,
+}
+
+/// Read a discovered transcript's fingerprint and bytes together, never
+/// allocating more than `limit + 1` bytes. The size is checked on the open
+/// handle before any read, and the read itself is capped, so a file that
+/// grows between the two checks is still reported oversize rather than read.
+/// Returns `None` (the caller skips the file) when it vanished or became
+/// unreadable between the directory walk and this read.
+fn read_transcript(path: &Path, limit: u64) -> Option<Transcript> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    let mut bytes = Vec::new();
+    if meta.len() <= limit {
+        bytes.reserve_exact(usize::try_from(meta.len()).ok()?.saturating_add(1));
+        file.take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .ok()?;
+    }
+    if meta.len() > limit || bytes.len() as u64 > limit {
+        return Some(Transcript::Oversize);
+    }
+    Some(Transcript::Bytes(fingerprint_of(&meta), bytes))
+}
+
+/// One visited source item.
+pub enum Found {
+    Transcript(Box<Discovered>),
+    /// A transcript whose source bytes exceed the bound. Never read into memory.
+    Oversize(PathBuf),
+}
+
+/// A visit stopped by the source scan or by the visitor itself.
+#[derive(Debug)]
+pub enum VisitError<E> {
+    Source(SourceError),
+    Visitor(E),
+}
+
+impl<E> From<SourceError> for VisitError<E> {
+    fn from(error: SourceError) -> Self {
+        Self::Source(error)
+    }
+}
+
+/// Collect every discovered transcript: the unbounded, in-memory form used by
+/// the upload sweep. Streaming callers use the `visit_*` functions instead.
+fn collect(
+    scan: impl FnOnce(
+        &mut dyn FnMut(Found) -> Result<(), std::convert::Infallible>,
+    ) -> Result<(), VisitError<std::convert::Infallible>>,
+) -> Result<Vec<Discovered>, SourceError> {
+    let mut out = Vec::new();
+    scan(&mut |found| {
+        if let Found::Transcript(discovered) = found {
+            out.push(*discovered);
+        }
+        Ok(())
+    })
+    .map_err(|error| match error {
+        VisitError::Source(error) => error,
+        VisitError::Visitor(never) => match never {},
+    })?;
+    Ok(out)
+}
+
+type Parse<'a> = &'a dyn Fn(&Path, &[u8]) -> Result<SessionEnvelope, ParseError>;
+
+/// Read, parse, and hand over one file at a time, so peak memory is one
+/// transcript rather than the whole corpus.
+fn visit_files<E>(
+    files: Vec<PathBuf>,
+    limit: u64,
+    parse: Parse<'_>,
+    warn: fn(&Path, &ParseError),
+    visit: &mut dyn FnMut(Found) -> Result<(), E>,
+) -> Result<(), VisitError<E>> {
+    for path in files {
+        let found = match read_transcript(&path, limit) {
+            None => continue,
+            Some(Transcript::Oversize) => Found::Oversize(path),
+            Some(Transcript::Bytes(fingerprint, bytes)) => match parse(&path, &bytes) {
+                Ok(env) => Found::Transcript(Box::new(Discovered {
+                    path,
+                    fingerprint,
+                    envelope: enrich(env),
+                })),
+                Err(ParseError::Empty) => continue,
+                Err(e) => {
+                    warn(&path, &e);
+                    continue;
+                }
+            },
+        };
+        visit(found).map_err(VisitError::Visitor)?;
+    }
+    Ok(())
 }
 
 /// Enrich an envelope's metadata with repo/git_remote derived from its cwd.
@@ -147,6 +235,17 @@ fn warn_skip_codex(path: &Path, error: &ParseError) {
 /// Each `<sessionUuid>.jsonl` (including nested subagent transcripts) becomes an
 /// envelope. The file stem is the native session id.
 pub fn discover_claude(root: &Path, origin: &Origin) -> Result<Vec<Discovered>, SourceError> {
+    collect(|visit| visit_claude(root, origin, u64::MAX, visit))
+}
+
+/// Streaming form of [`discover_claude`]: files larger than `limit` bytes are
+/// reported as [`Found::Oversize`] without being read.
+pub fn visit_claude<E>(
+    root: &Path,
+    origin: &Origin,
+    limit: u64,
+    visit: &mut dyn FnMut(Found) -> Result<(), E>,
+) -> Result<(), VisitError<E>> {
     let mut files = Vec::new();
     walk(
         root,
@@ -154,28 +253,26 @@ pub fn discover_claude(root: &Path, origin: &Origin) -> Result<Vec<Discovered>, 
         &mut files,
     )?;
     files.sort();
-    let mut out = Vec::new();
-    for path in files {
-        let Some((fp, bytes)) = read_transcript(&path) else {
-            continue;
-        };
+    let parse = |path: &Path, bytes: &[u8]| {
         let native_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        match read_claude(&bytes, native_id, origin.clone()) {
-            Ok(env) => out.push(Discovered {
-                path,
-                fingerprint: fp,
-                envelope: enrich(env),
-            }),
-            Err(ParseError::Empty) => {}
-            Err(e) => warn_skip_claude(&path, &e),
-        }
-    }
-    Ok(out)
+        read_claude(bytes, native_id, origin.clone())
+    };
+    visit_files(files, limit, &parse, warn_skip_claude, visit)
 }
 
 /// Discover Codex rollout transcripts under `root` (`~/.codex/sessions`).
 /// Only `rollout-*.jsonl` files (possibly nested under YYYY/MM/DD) are read.
 pub fn discover_codex(root: &Path, origin: &Origin) -> Result<Vec<Discovered>, SourceError> {
+    collect(|visit| visit_codex(root, origin, u64::MAX, visit))
+}
+
+/// Streaming form of [`discover_codex`], bounded like [`visit_claude`].
+pub fn visit_codex<E>(
+    root: &Path,
+    origin: &Origin,
+    limit: u64,
+    visit: &mut dyn FnMut(Found) -> Result<(), E>,
+) -> Result<(), VisitError<E>> {
     let mut files = Vec::new();
     walk(
         root,
@@ -188,24 +285,12 @@ pub fn discover_codex(root: &Path, origin: &Origin) -> Result<Vec<Discovered>, S
         &mut files,
     )?;
     files.sort();
-    let mut out = Vec::new();
-    for path in files {
-        let Some((fp, bytes)) = read_transcript(&path) else {
-            continue;
-        };
+    let parse = |path: &Path, bytes: &[u8]| {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let fallback_id = stem.strip_prefix("rollout-").unwrap_or(stem);
-        match read_codex(&bytes, fallback_id, origin.clone()) {
-            Ok(env) => out.push(Discovered {
-                path,
-                fingerprint: fp,
-                envelope: enrich(env),
-            }),
-            Err(ParseError::Empty) => {}
-            Err(e) => warn_skip_codex(&path, &e),
-        }
-    }
-    Ok(out)
+        read_codex(bytes, fallback_id, origin.clone())
+    };
+    visit_files(files, limit, &parse, warn_skip_codex, visit)
 }
 
 /// Discover Cursor chat threads from the state DB.
@@ -584,11 +669,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("t.jsonl");
         write(&f, "payload");
-        let fp = fingerprint(&f).expect("fingerprint of a real file is Some");
-        assert!(fp.contains(':'), "fingerprint is `<mtime>:<len>`: {fp}");
-        let (fp2, bytes) = read_transcript(&f).expect("read_transcript is Some");
-        assert_eq!(fp2, fp);
-        assert_eq!(bytes, b"payload");
+        assert!(matches!(
+            read_transcript(&f, 7),
+            Some(Transcript::Bytes(fp, bytes)) if fp.ends_with(":7") && bytes == b"payload"
+        ));
+        assert!(matches!(read_transcript(&f, 6), Some(Transcript::Oversize)));
     }
 
     #[test]
@@ -597,8 +682,7 @@ mod tests {
         // None edge, and `read_transcript` short-circuits through its own `?`.
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("gone.jsonl");
-        assert!(fingerprint(&missing).is_none());
-        assert!(read_transcript(&missing).is_none());
+        assert!(read_transcript(&missing, u64::MAX).is_none());
     }
 
     #[test]

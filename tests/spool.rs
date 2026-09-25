@@ -82,11 +82,13 @@ fn corrupted_missing_and_oversized_objects_never_read_as_original() {
         spool.read(entry.sequence, 100_000),
         Err(SpoolError::Integrity)
     ));
+    assert!(matches!(spool.store(&original), Err(SpoolError::Integrity)));
     fs::remove_file(&path).unwrap();
-    assert!(matches!(
-        spool.read(entry.sequence, 100_000),
-        Err(SpoolError::Io(_))
-    ));
+    let missing = spool.read(entry.sequence, 100_000).unwrap_err();
+    assert!(matches!(missing, SpoolError::Io(_)));
+    assert!(missing.is_integrity());
+    assert!(!SpoolError::Schema.is_integrity());
+    assert!(!SpoolError::Io(std::io::Error::other("transient")).is_integrity());
     assert!(matches!(
         spool.read(999, 100_000),
         Err(SpoolError::NotFound)
@@ -131,4 +133,109 @@ fn schema_mismatch_and_absent_readonly_spools_fail_without_creation() {
     let blocked = temp.path().join("file");
     fs::write(&blocked, b"not a directory").unwrap();
     assert!(LocalSpool::open(Path::new(&blocked)).is_err());
+}
+
+#[test]
+fn bounded_store_serializes_once_and_leaves_nothing_behind_when_oversize() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut spool = LocalSpool::open(temp.path()).unwrap();
+    let original = envelope("native", "bounded body");
+    let exact = serde_json::to_vec(&original).unwrap();
+    assert!(spool
+        .store_bounded(&original, exact.len() - 1)
+        .unwrap()
+        .is_none());
+    let objects = temp.path().join("objects");
+    assert_eq!(fs::read_dir(&objects).unwrap().count(), 0);
+    assert_eq!(spool.watermark().unwrap(), 0);
+    let (entry, inserted) = spool
+        .store_bounded(&original, exact.len())
+        .unwrap()
+        .unwrap();
+    assert!(inserted);
+    assert_eq!(entry.byte_count as usize, exact.len());
+    assert_eq!(spool.read(entry.sequence, exact.len()).unwrap(), exact);
+    assert_eq!(fs::read_dir(&objects).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn links_and_replacement_never_redirect_spool_reads_or_writes() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let root = temp.path().join("spool");
+
+    // A planted root, object directory, or database link is refused at open.
+    symlink(&outside, &root).unwrap();
+    assert!(LocalSpool::open(&root).is_err());
+    assert!(LocalSpool::open_readonly(&root).is_err());
+    fs::remove_file(&root).unwrap();
+    fs::create_dir(&root).unwrap();
+    symlink(&outside, root.join("objects")).unwrap();
+    assert!(LocalSpool::open(&root).is_err());
+    fs::remove_file(root.join("objects")).unwrap();
+    fs::write(outside.join("db"), b"").unwrap();
+    symlink(outside.join("db"), root.join("inventory.sqlite3")).unwrap();
+    assert!(LocalSpool::open(&root).is_err());
+    fs::remove_file(root.join("inventory.sqlite3")).unwrap();
+
+    // An object replaced by a link reads as an integrity failure, not as the
+    // link target, even when the target holds the right bytes.
+    let mut spool = LocalSpool::open(&root).unwrap();
+    let original = envelope("native", "body");
+    let entry = spool.store(&original).unwrap().0;
+    let object = root.join("objects").join(&entry.archive_sha256);
+    fs::rename(&object, outside.join("copy")).unwrap();
+    symlink(outside.join("copy"), &object).unwrap();
+    let error = spool.read(entry.sequence, 100_000).unwrap_err();
+    assert!(error.is_integrity(), "{error}");
+    fs::remove_file(&object).unwrap();
+    fs::rename(outside.join("copy"), &object).unwrap();
+    assert!(spool.read(entry.sequence, 100_000).is_ok());
+
+    // The object directory swapped for a link after open: every access fails
+    // closed and nothing is written through the link.
+    fs::rename(root.join("objects"), temp.path().join("moved")).unwrap();
+    symlink(&outside, root.join("objects")).unwrap();
+    assert!(matches!(
+        spool.store(&envelope("other", "body")),
+        Err(SpoolError::Untrusted)
+    ));
+    let error = spool.read(entry.sequence, 100_000).unwrap_err();
+    assert!(matches!(error, SpoolError::Untrusted));
+    assert!(!error.is_integrity());
+    let names: Vec<_> = fs::read_dir(&outside)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("db")]);
+}
+
+#[test]
+fn a_source_scan_failure_is_reported_as_such() {
+    let temp = tempfile::tempdir().unwrap();
+    let not_a_directory = temp.path().join("file");
+    fs::write(&not_a_directory, b"").unwrap();
+    let cfg = agentic_session_exporter::config::Config {
+        store_url: String::new(),
+        write_token: None,
+        origin_host: "test".into(),
+        origin_environment: "local".into(),
+        origin_deployment: None,
+        claude_root: not_a_directory,
+        codex_root: temp.path().join("absent"),
+        cursor_db: None,
+        cursor_limit: None,
+        state_file: temp.path().join("state"),
+        ignore_state: false,
+        health_file: temp.path().join("health"),
+        health_max_age_secs: 900,
+        batch_size: 50,
+        max_envelope_bytes: 1024,
+        tags: Vec::new(),
+    };
+    let result = agentic_session_exporter::spool::capture_local(&cfg, &temp.path().join("spool"));
+    assert!(matches!(result, Err(SpoolError::Source(_))));
 }

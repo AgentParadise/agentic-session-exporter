@@ -85,26 +85,45 @@ pub struct DrainSummary {
     pub pending: usize,
     pub failed: usize,
     pub remaining: i64,
+    /// Rows whose stored payload no longer decodes. They are set aside with
+    /// their identity intact rather than retried or allowed to block the
+    /// rows behind them; this is the total currently set aside.
+    pub quarantined: i64,
 }
 
+const DATABASE: &str = "inventory-outbox.sqlite3";
+const VERSION: u32 = 2;
+
 pub struct InventoryOutbox {
+    dir: crate::secure_fs::SecureDir,
     db: Connection,
     destination_hash: String,
 }
 impl InventoryOutbox {
     pub fn open(root: &Path, client: &InventoryClient) -> Result<Self, OutboxError> {
-        crate::spool::private_directory(root)?;
-        let db = Connection::open(root.join("inventory-outbox.sqlite3"))?;
+        let dir = crate::secure_fs::SecureDir::open_root(root, true)?;
+        let mut db = Connection::open_with_flags(
+            dir.sqlite_path(DATABASE)?,
+            crate::secure_fs::sqlite_flags(false),
+        )?;
+        dir.verify()?;
         db.busy_timeout(Duration::from_secs(30))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
-        let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 1 {
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version > VERSION {
             return Err(OutboxError::Version);
         }
-        db.execute_batch("CREATE TABLE IF NOT EXISTS destination (singleton INTEGER PRIMARY KEY CHECK(singleton=1), hash TEXT NOT NULL);
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS destination (singleton INTEGER PRIMARY KEY CHECK(singleton=1), hash TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS operations (sequence INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(acknowledged IN (0,1)));
-            CREATE INDEX IF NOT EXISTS pending_operations ON operations(acknowledged, attempts, sequence);
-            PRAGMA user_version=1;")?;
+            CREATE INDEX IF NOT EXISTS pending_operations ON operations(acknowledged, attempts, sequence);")?;
+        if version < 2 {
+            tx.execute_batch(
+                "ALTER TABLE operations ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0;
+                PRAGMA user_version=2;",
+            )?;
+        }
+        tx.commit()?;
         let destination_hash = destination_hash(client);
         db.execute(
             "INSERT OR IGNORE INTO destination VALUES(1, ?1)",
@@ -117,8 +136,9 @@ impl InventoryOutbox {
         if actual != destination_hash {
             return Err(OutboxError::Destination);
         }
-        crate::spool::sync_directory(root)?;
+        dir.sync()?;
         Ok(Self {
+            dir,
             db,
             destination_hash,
         })
@@ -160,10 +180,12 @@ impl InventoryOutbox {
         if destination_hash(client) != self.destination_hash {
             return Err(OutboxError::Destination);
         }
+        self.dir.verify()?;
         let ids: Vec<i64> = self
             .db
             .prepare(
-                "SELECT sequence FROM operations WHERE acknowledged=0 ORDER BY attempts, sequence LIMIT ?1",
+                "SELECT sequence FROM operations WHERE acknowledged=0 AND NOT quarantined
+                 ORDER BY attempts, sequence LIMIT ?1",
             )?
             .query_map([limit as i64], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
@@ -174,7 +196,15 @@ impl InventoryOutbox {
                 [id],
                 |r| r.get(0),
             )?;
-            let operation: InventoryOperation = serde_json::from_str(&payload)?;
+            // One undecodable row is that row's problem. Aborting here would
+            // strand every valid operation queued behind it indefinitely.
+            let Ok(operation) = serde_json::from_str::<InventoryOperation>(&payload) else {
+                self.db.execute(
+                    "UPDATE operations SET quarantined=1 WHERE sequence=?1",
+                    [id],
+                )?;
+                continue;
+            };
             self.db.execute(
                 "UPDATE operations SET attempts=attempts+1 WHERE sequence=?1",
                 [id],
@@ -191,10 +221,11 @@ impl InventoryOutbox {
                 Err(_) => summary.failed += 1,
             }
         }
-        summary.remaining = self.db.query_row(
-            "SELECT count(*) FROM operations WHERE acknowledged=0",
+        (summary.remaining, summary.quarantined) = self.db.query_row(
+            "SELECT count(*) FILTER (WHERE NOT quarantined), count(*) FILTER (WHERE quarantined)
+             FROM operations WHERE acknowledged=0",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         Ok(summary)
     }
@@ -305,5 +336,101 @@ mod tests {
             Err(OutboxError::Invalid)
         ));
         worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_malformed_row_is_quarantined_and_later_rows_still_deliver() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let count = stream.read(&mut buf).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buf[..count]);
+                if let Some(i) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&request[..i]).to_lowercase();
+                    let length: usize = header
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= i + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("POST /v1/inventory/revisions "));
+            assert!(request.contains("\"revision_id\":\"second\""));
+            let body = "{\"duplicate\":false}";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let client = InventoryClient::new(&url, "secret".into()).unwrap();
+        let outbox = InventoryOutbox::open(root.path(), &client).unwrap();
+        assert!(outbox
+            .enqueue(&InventoryOperation::Stage(revision("first")))
+            .unwrap());
+        assert!(outbox
+            .enqueue(&InventoryOperation::Stage(revision("second")))
+            .unwrap());
+        // Damage the first queued payload directly in SQLite.
+        outbox
+            .db
+            .execute(
+                "UPDATE operations SET payload='{\"truncated' WHERE sequence=1",
+                [],
+            )
+            .unwrap();
+        let summary = outbox.drain(&client, 2).await.unwrap();
+        assert_eq!(
+            (
+                summary.acknowledged,
+                summary.failed,
+                summary.remaining,
+                summary.quarantined
+            ),
+            (1, 0, 0, 1)
+        );
+        worker.join().unwrap();
+        drop(outbox);
+        // The quarantined row keeps its identity, is never retried, and is
+        // still reported after a restart.
+        let outbox = InventoryOutbox::open(root.path(), &client).unwrap();
+        let again = outbox.drain(&client, 2).await.unwrap();
+        assert_eq!(
+            (again.acknowledged, again.failed, again.quarantined),
+            (0, 0, 1)
+        );
+        let identity: String = outbox
+            .db
+            .query_row(
+                "SELECT identity FROM operations WHERE quarantined",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(identity.contains("first"));
+        drop(outbox);
+        rusqlite::Connection::open(root.path().join(DATABASE))
+            .unwrap()
+            .pragma_update(None, "user_version", 99)
+            .unwrap();
+        assert!(matches!(
+            InventoryOutbox::open(root.path(), &client),
+            Err(OutboxError::Version)
+        ));
     }
 }

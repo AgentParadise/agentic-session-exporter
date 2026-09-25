@@ -59,6 +59,12 @@ thiserror = "2"
 async-trait = "0.1"
 tempfile = "3"
 
+# Already in the tree through tempfile. Directory-relative, no-follow opens
+# (openat/linkat/unlinkat) keep durable state beneath a verified root, which
+# std cannot express. See src/secure_fs.rs.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
+
 [dev-dependencies]
 temp-env = "0.3"
 

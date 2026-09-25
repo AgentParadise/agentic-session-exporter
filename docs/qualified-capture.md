@@ -42,7 +42,8 @@ prove production scheduling or native harness capture hooks.
 
 Set `SESSION_STORE_URL`, `CAPTURE_WRITE_TOKEN`, and an absolute
 `EXPORTER_CAPTURE_DIR`. The capture token must have a grant for the exact source
-installation and harness. Enqueue itself performs no HTTP request.
+installation and harness. Enqueue itself performs no HTTP request. The directory
+is opened as a trusted root, as described in [local-spool.md](local-spool.md).
 
 `apss-session-exporter --capture-enqueue` reads one I-JSON object from stdin:
 `{"identity":{"source_instance_id":"...","harness":"...","native_session_id":"..."},"envelope":{...}}`.
@@ -51,8 +52,10 @@ The envelope follows APS-V1-0004. Input is limited to 64 MiB. Success emits
 retry emits `inserted:false`.
 
 `apss-session-exporter --capture-drain N` attempts 1 to 50 queued captures and
-emits `acknowledged`, `failed`, and `remaining` counts. Exit 0 means no pending
-work remains; exit 3 means pending work remains. Invalid flags exit 2. Operational
+emits `acknowledged`, `failed`, `remaining`, `deleted`, `withdrawn`, `busy`,
+`integrity`, and `quarantined` counts. Exit 0 means no pending work remains and
+nothing is quarantined; exit 3 means pending work remains or a row is
+quarantined. Invalid flags exit 2. Operational
 or input failures return nonzero without emitting an acceptance receipt. These
 modes always emit JSON and reject `--json` and capture-sweep options.
 
@@ -76,9 +79,31 @@ and receipt lookup no longer reports the historical acceptance as current access
 
 `--capture-drain` sends pending DELETE requests before uploads, within its existing
 operation limit. Only HTTP 204 acknowledges deletion. Failed requests survive
-restart; credentials and response bodies are excluded from errors. A store's 410
-upload response permanently cancels that upload and queues idempotent deletion.
-SQLite schema version 3 preserves existing deliveries during upgrade.
+restart; credentials and response bodies are excluded from errors.
+
+Upload and deletion of one revision never overlap, even across processes that
+share the outbox. Each remote request holds a lease row for its storage key and
+content hash, and the tombstone check before an upload happens only while that
+lease is held. A deletion is therefore sent entirely before an upload, which
+then sees the tombstone and never goes out, or entirely after it, and removes
+what the upload stored. A drain that finds a revision leased skips it for that
+pass and reports it as `busy`; it stays pending. A lease expires after five
+minutes, far beyond the 30 second request timeout, so a holder that died
+releases it unattended.
+
+The store is the final authority. A store's 410 upload response means it holds a
+tombstone for that revision: the upload is `withdrawn`, which is terminal. It is
+never retried, the queued body is dropped, and no DELETE is sent because the
+store already has one. Re-enqueue of that revision is rejected.
+
+A queued row whose spool object is missing, altered, or undecodable, whose
+identity no longer decodes, or whose recorded content hash no longer matches its
+bytes is quarantined and counted under `integrity` for that pass. Retrying cannot
+repair it, so it is set aside with its identity and never retried, and the pass
+continues with unrelated work. `quarantined` reports the total set aside, by
+identity only, never transcript content. A failure of the spool as a whole, such
+as its object directory being replaced, is `failed` and retried instead. SQLite
+schema version 4 preserves existing deliveries during upgrade.
 
 This prevents queued transmission and remote resurrection once the store accepts
 the tombstone. Drain also removes deleted envelope files from the outbox spool,
