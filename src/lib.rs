@@ -16,13 +16,19 @@
 // duplicate `must_use` annotation reported by current nightly Clippy.
 #![allow(clippy::double_must_use)]
 
+pub mod capture_outbox;
 pub mod config;
 pub mod cursor;
 pub mod gitmeta;
 pub mod health;
+pub mod inventory;
+pub mod inventory_outbox;
 pub mod parsers;
+pub mod qualified_capture;
 pub mod reconstitute;
+pub mod secure_fs;
 pub mod sources;
+pub mod spool;
 pub mod state;
 pub mod upload;
 
@@ -36,7 +42,7 @@ use crate::state::State;
 use crate::upload::{tally, BatchSender, Client, Outcome};
 
 /// Aggregate outcome of a full run.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct RunSummary {
     pub discovered: usize,
     pub skipped_unchanged: usize,
@@ -60,6 +66,37 @@ pub struct RunSummary {
     /// success: the items were left unmarked, so they retried, while every
     /// failure counter stayed zero and the run looked complete.
     pub unconfirmed: usize,
+    /// Session ids the STORE confirmed it holds during this sweep, in the order
+    /// they were confirmed.
+    ///
+    /// Populated at exactly the points where an envelope is marked in state, so
+    /// membership here means the same thing marking does: the store answered
+    /// `Accepted` or `Duplicate` for that specific envelope.
+    ///
+    /// Deliberately NOT including `skipped_unchanged`. Those were never sent
+    /// this sweep, so the store said nothing about them - only local state
+    /// claims they are held. A caller asking "is MY session in the store" needs
+    /// an answer backed by the store, not by a file the audited agent can write.
+    ///
+    /// A MULTISET, like the confirmation logic it mirrors: two envelopes can
+    /// share a session id while differing in content, and each confirmation
+    /// covers exactly one of them.
+    ///
+    /// LIMIT, and it is a sharp one: this is an ACKNOWLEDGEMENT LIST, not a
+    /// proof of authenticity. The session id is derived from the transcript
+    /// itself - for Claude it is literally the filename stem (`sources.rs`),
+    /// for Codex the payload id with a filename fallback - and the spool is
+    /// agent-writable. An agent that knows the id being looked for can delete
+    /// the real transcript and write a well-formed decoy carrying that same id;
+    /// the exporter will upload it and honestly report the id here.
+    ///
+    /// So a consumer may use membership to detect a session that never reached
+    /// the store. It may NOT use membership to conclude that the bytes the
+    /// store holds are the ones the agent actually produced. Closing that
+    /// requires an identity the agent cannot substitute - transcript bytes
+    /// hashed from a location it cannot write - which is not something this
+    /// exporter can establish on its own.
+    pub confirmed_sessions: Vec<String>,
 }
 
 /// Run errors that abort the whole sweep.
@@ -101,10 +138,7 @@ pub(crate) fn install_warn_logging() {
 /// Discover every source's transcripts under the configured roots. Public so the
 /// binary can print a dry-run count.
 pub fn discover_all(cfg: &Config) -> Result<Vec<Discovered>, sources::SourceError> {
-    let mut origin = Origin::new(cfg.origin_host.clone(), cfg.origin_environment.clone());
-    if let Some(deployment) = &cfg.origin_deployment {
-        origin = origin.with_deployment(deployment.clone());
-    }
+    let origin = origin_of(cfg);
     let mut all = Vec::new();
     all.extend(sources::discover_claude(&cfg.claude_root, &origin)?);
     all.extend(sources::discover_codex(&cfg.codex_root, &origin)?);
@@ -117,6 +151,71 @@ pub fn discover_all(cfg: &Config) -> Result<Vec<Discovered>, sources::SourceErro
         stamp_tags(&mut d.envelope, &cfg.tags);
     }
     Ok(all)
+}
+
+fn origin_of(cfg: &Config) -> Origin {
+    let mut origin = Origin::new(cfg.origin_host.clone(), cfg.origin_environment.clone());
+    if let Some(deployment) = &cfg.origin_deployment {
+        origin = origin.with_deployment(deployment.clone());
+    }
+    origin
+}
+
+/// Most Cursor threads a streaming sweep holds candidates for. Real databases
+/// hold low thousands; beyond this, older threads are reported as overflow.
+pub const CURSOR_MAX_THREADS: usize = 100_000;
+
+/// Streaming discovery for callers that must not hold the corpus in memory.
+/// Claude and Codex files larger than `limit` bytes are reported as
+/// [`sources::Found::Oversize`] without being read; each other transcript is
+/// handed to `visit` and dropped before the next is read. Directories are
+/// walked without buffering their listings. Cursor threads are streamed newest
+/// first under [`CURSOR_MAX_THREADS`] and the same byte bound, with anything
+/// left out reported as oversize or overflow.
+pub fn visit_all<E>(
+    cfg: &Config,
+    limit: u64,
+    visit: &mut dyn FnMut(sources::Found) -> Result<(), E>,
+) -> Result<(), sources::VisitError<E>> {
+    use sources::Found;
+    let origin = origin_of(cfg);
+    let mut stamped = |found: Found| {
+        visit(match found {
+            Found::Transcript(mut discovered) => {
+                stamp_tags(&mut discovered.envelope, &cfg.tags);
+                Found::Transcript(discovered)
+            }
+            oversize => oversize,
+        })
+    };
+    sources::visit_claude(&cfg.claude_root, &origin, limit, &mut stamped)?;
+    sources::visit_codex(&cfg.codex_root, &origin, limit, &mut stamped)?;
+    if let Some(db) = &cfg.cursor_db {
+        let bounds = cursor::ThreadBounds {
+            max_threads: CURSOR_MAX_THREADS,
+            max_bytes: limit,
+        };
+        cursor::visit_threads(db, &origin, cfg.cursor_limit, bounds, &mut |item| {
+            stamped(match item {
+                cursor::ThreadItem::Thread(thread) => {
+                    let thread = *thread;
+                    Found::Transcript(Box::new(sources::Discovered {
+                        path: sources::cursor_path(db, &thread.envelope.session_id),
+                        fingerprint: thread.fingerprint,
+                        envelope: thread.envelope,
+                    }))
+                }
+                cursor::ThreadItem::Oversize(key) => Found::Oversize(sources::cursor_path(
+                    db,
+                    key.strip_prefix("composerData:").unwrap_or(&key),
+                )),
+                cursor::ThreadItem::Overflow(count) => Found::Overflow(count),
+            })
+        })
+        .map_err(|error| sources::VisitError::Source(error.into()))?
+        .map_err(sources::VisitError::Visitor)?;
+    }
+    Ok(())
 }
 
 /// Add the caller's correlation tags to an envelope, leaving any tags a parser
@@ -150,7 +249,14 @@ pub async fn run(cfg: &Config) -> Result<RunSummary, RunError> {
     }
 
     let discovered = discover_all(cfg)?;
-    let mut state = State::load(&cfg.state_file, &cfg.stamp_digest());
+    // A caller that cannot trust the state file asks for it to be ignored
+    // rather than protected: where the file sits somewhere the audited process
+    // can write, "protect it" has no implementation.
+    let mut state = if cfg.ignore_state {
+        State::ignoring(&cfg.state_file, &cfg.stamp_digest())
+    } else {
+        State::load(&cfg.state_file, &cfg.stamp_digest())
+    };
 
     let mut summary = RunSummary {
         discovered: discovered.len(),
@@ -263,15 +369,20 @@ async fn upload_pending<S: BatchSender + ?Sized>(
                 // a caller reading the counters should be able to tell them
                 // apart: one is a bad envelope, the other is a store not
                 // answering its contract.
-                let mut rejected_ids: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
+                // A COUNTED multiset, for the same reason `confirmed` is one.
+                // As a set, a single rejection covering two envelopes that
+                // share a session id suppressed `unconfirmed` for BOTH: one was
+                // genuinely refused, the other got no answer at all, and the
+                // sweep under-reported the loss it had just taken.
+                let mut rejected_ids: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
                 for r in &results {
                     match r {
                         Outcome::Accepted { .. } | Outcome::Duplicate { .. } => {
                             *confirmed.entry(r.session_id()).or_insert(0) += 1;
                         }
                         Outcome::Rejected { .. } => {
-                            rejected_ids.insert(r.session_id());
+                            *rejected_ids.entry(r.session_id()).or_insert(0) += 1;
                         }
                     }
                 }
@@ -293,17 +404,20 @@ async fn upload_pending<S: BatchSender + ?Sized>(
                         Some(remaining) if *remaining > 0 => {
                             *remaining -= 1;
                             state.mark(path, fp.clone());
+                            summary.confirmed_sessions.push(env.session_id.clone());
                         }
                         // Left unmarked either way, so the next sweep retries
                         // it. Counted as unconfirmed ONLY when the store said
                         // nothing about it; an explicit rejection is already
                         // counted as rejected and both make the sweep
                         // incomplete.
-                        _ => {
-                            if !rejected_ids.contains(env.session_id.as_str()) {
-                                summary.unconfirmed += 1;
-                            }
-                        }
+                        _ => match rejected_ids.get_mut(env.session_id.as_str()) {
+                            // Consume one rejection per envelope, so a second
+                            // envelope sharing the id is still counted as
+                            // unconfirmed unless the store refused it too.
+                            Some(remaining) if *remaining > 0 => *remaining -= 1,
+                            _ => summary.unconfirmed += 1,
+                        },
                     }
                 }
             }
@@ -353,6 +467,7 @@ async fn upload_one_resilient<S: BatchSender + ?Sized>(
                     && r.session_id() == env.session_id
             }) {
                 state.mark(path, fp.to_string());
+                summary.confirmed_sessions.push(env.session_id.clone());
             } else if t.rejected == 0 {
                 // Neither confirmed nor explicitly rejected: the store answered
                 // without saying anything about what was sent.
@@ -810,6 +925,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_sessions_names_exactly_what_the_store_confirmed() {
+        // The security property behind this field: a caller must be able to ask
+        // "is MY session in the store", not merely "did some number of sessions
+        // land". Counters alone let a sweep that captured an unrelated decoy
+        // report the same success as one that captured the session asked about.
+        let sender = MockSender::new(&["big"]);
+        let items = pending(&[("a", 10), ("big", 10), ("c", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&sender, 50, &items, &mut state, &mut summary).await;
+
+        // "big" failed its solo retry, so it is absent - being discovered and
+        // attempted is not the same as being held by the store.
+        assert_eq!(
+            summary.confirmed_sessions,
+            vec!["a".to_string(), "c".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whole_batch_that_succeeds_confirms_every_session_in_it() {
+        // The batch path, not the solo-retry path. MockSender rejects any batch
+        // larger than one item, so every other test here reaches confirmation
+        // through solo retries and leaves the batch path unexercised - a gap a
+        // mutation check found by deleting the batch-path confirmation without
+        // breaking a single test.
+        struct AcceptBatch;
+
+        #[async_trait]
+        impl BatchSender for AcceptBatch {
+            async fn send_batch(
+                &self,
+                batch: &[SessionEnvelope],
+            ) -> Result<Vec<Outcome>, UploadError> {
+                Ok(batch
+                    .iter()
+                    .map(|e| Outcome::Accepted {
+                        session_id: e.session_id.clone(),
+                    })
+                    .collect())
+            }
+        }
+
+        let items = pending(&[("a", 10), ("b", 10), ("c", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&AcceptBatch, 50, &items, &mut state, &mut summary).await;
+
+        assert_eq!(summary.accepted, 3);
+        assert_eq!(
+            summary.confirmed_sessions,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_rejection_does_not_excuse_a_second_envelope_with_the_same_id() {
+        // Two envelopes share a session id; the store refuses ONE and says
+        // nothing about the other. Before rejected_ids became a counted
+        // multiset, the single rejection suppressed `unconfirmed` for both, so
+        // the sweep under-reported a session it had just failed to store.
+        struct RejectOnce;
+
+        #[async_trait]
+        impl BatchSender for RejectOnce {
+            async fn send_batch(
+                &self,
+                batch: &[SessionEnvelope],
+            ) -> Result<Vec<Outcome>, UploadError> {
+                // One result for a two-envelope batch: a refusal for the id,
+                // and silence about the other envelope carrying it.
+                Ok(vec![Outcome::Rejected {
+                    session_id: batch[0].session_id.clone(),
+                    reason: "schema".into(),
+                }])
+            }
+        }
+
+        let items = pending(&[("dup", 10), ("dup", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&RejectOnce, 50, &items, &mut state, &mut summary).await;
+
+        assert_eq!(summary.rejected, 1, "the store refused exactly one");
+        assert_eq!(
+            summary.unconfirmed, 1,
+            "the envelope the store said nothing about must still count as unconfirmed"
+        );
+        assert!(summary.confirmed_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_session_is_never_confirmed() {
+        // A rejection is the store saying "I refused this". Recording it as
+        // confirmed would be the same class of bug as marking it in state:
+        // the caller stops asking about a session nobody has.
+        struct RejectEverything;
+
+        #[async_trait]
+        impl BatchSender for RejectEverything {
+            async fn send_batch(
+                &self,
+                batch: &[SessionEnvelope],
+            ) -> Result<Vec<Outcome>, UploadError> {
+                Ok(vec![Outcome::Rejected {
+                    session_id: batch[0].session_id.clone(),
+                    reason: "schema".into(),
+                }])
+            }
+        }
+
+        let items = pending(&[("solo", 10)]);
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+
+        upload_pending(&RejectEverything, 50, &items, &mut state, &mut summary).await;
+
+        assert_eq!(summary.rejected, 1);
+        assert!(
+            summary.confirmed_sessions.is_empty(),
+            "a refused session must not appear as confirmed"
+        );
+    }
+
+    #[tokio::test]
     async fn successful_batch_marks_all_and_does_not_fall_back() {
         // A single item never trips the >1 batch failure, so it goes straight
         // through as an accepted solo send with no fallback churn.
@@ -964,6 +1207,7 @@ mod tests {
         write_claude_transcript(&claude_root);
         Config {
             origin_deployment: None,
+            ignore_state: false,
             store_url: store_url.to_string(),
             write_token: Some("tok".into()),
             origin_host: "test-host".into(),
@@ -1019,6 +1263,54 @@ mod tests {
         let found = discover_all(&cfg).unwrap();
         assert_eq!(found.len(), 2); // one claude + one cursor
         assert!(found.iter().all(|d| d.envelope.origin.host == "test-host"));
+
+        // The streaming form visits the same transcripts, one at a time.
+        let cfg = Config {
+            tags: vec!["ci:run:7".into()],
+            ..cfg
+        };
+        let mut visited = Vec::new();
+        visit_all(&cfg, u64::MAX, &mut |found| {
+            if let sources::Found::Transcript(d) = found {
+                visited.push((
+                    d.envelope.session_id.clone(),
+                    d.envelope.metadata.unwrap().tags,
+                ));
+            }
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        let expected: Vec<_> = found
+            .iter()
+            .map(|d| d.envelope.session_id.clone())
+            .collect();
+        assert_eq!(
+            visited.iter().map(|v| v.0.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(visited
+            .iter()
+            .all(|v| v.1.contains(&"ci:run:7".to_string())));
+        // Over the bound, a source file and a Cursor thread are each reported
+        // without being parsed or assembled.
+        let mut oversize = Vec::new();
+        visit_all(&cfg, 1, &mut |found| {
+            if let sources::Found::Oversize(path) = found {
+                oversize.push(path.display().to_string());
+            }
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(oversize.len(), 2);
+        assert!(oversize[1].ends_with("state.vscdb#composer:c1"));
+        // A visitor failure stops the sweep and is returned as the visitor's.
+        let stopped = visit_all(&cfg, u64::MAX, &mut |found| match found {
+            sources::Found::Transcript(d) if d.envelope.source_format.starts_with("cursor") => {
+                Err("stop")
+            }
+            _ => Ok(()),
+        });
+        assert!(matches!(stopped, Err(sources::VisitError::Visitor("stop"))));
     }
 
     #[test]
@@ -1097,6 +1389,113 @@ mod tests {
         assert_eq!(summary.accepted, 1);
         assert_eq!(summary.failed, 0);
         assert!(cfg.health_file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_seeded_state_file_still_skips_when_state_is_trusted() {
+        // The behaviour --ignore-state exists to defeat, pinned first so the
+        // test below measures a real difference rather than a tautology.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = spawn_server(vec![http_response(200, b"ok")]);
+        let cfg = test_config(&url, tmp.path());
+
+        let discovered = discover_all(&cfg).unwrap();
+        let mut seeded = State::load(&cfg.state_file, &cfg.stamp_digest());
+        for item in &discovered {
+            seeded.mark(&item.path, item.fingerprint.clone());
+        }
+        seeded.save().unwrap();
+
+        let summary = run(&cfg).await.unwrap();
+
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.skipped_unchanged, 1);
+        assert_eq!(summary.accepted, 0, "nothing was sent to the store");
+    }
+
+    #[tokio::test]
+    async fn ignore_state_re_sends_despite_a_seeded_state_file() {
+        // THE SECURITY PROPERTY. The state file lives where the audited
+        // process can write it, so a forged entry can make a transcript that
+        // never reached the store report as a clean sweep. Protecting the file
+        // is not possible there; not reading it is.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = spawn_server(vec![
+            http_response(200, b"ok"),
+            http_response(
+                200,
+                br#"{"results":[{"status":"accepted","session_id":"11111111-2222-3333-4444-555555555555"}]}"#,
+            ),
+        ]);
+        let mut cfg = test_config(&url, tmp.path());
+
+        let discovered = discover_all(&cfg).unwrap();
+        let mut forged = State::load(&cfg.state_file, &cfg.stamp_digest());
+        for item in &discovered {
+            forged.mark(&item.path, item.fingerprint.clone());
+        }
+        forged.save().unwrap();
+
+        cfg.ignore_state = true;
+        let summary = run(&cfg).await.unwrap();
+
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(
+            summary.skipped_unchanged, 0,
+            "a forged state entry must not be believed"
+        );
+        // Asserting `accepted == 1` alone proved less than it looked: the
+        // canned response named session "s", which is not the discovered
+        // transcript, so the run would ALSO have counted it unconfirmed. The
+        // response now names the real session id and the unconfirmed counter
+        // is asserted, so this says the transcript reached the store rather
+        // than merely that a request happened.
+        assert_eq!(summary.accepted, 1, "the transcript was sent anyway");
+        assert_eq!(
+            summary.unconfirmed, 0,
+            "and the store confirmed THAT session"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignoring_state_never_rewrites_the_state_file() {
+        // An ignored state starts EMPTY. Saving it would replace a real file
+        // with only what this sweep confirmed, discarding entries for sessions
+        // that were rejected, filtered, or never reached - so a later normal
+        // run would resend all of them. A cache loss rather than a transcript
+        // loss, and conservative in direction, but a flag documented as "do
+        // not read the file" must not rewrite it either.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = spawn_server(vec![
+            http_response(200, b"ok"),
+            http_response(
+                200,
+                br#"{"results":[{"status":"accepted","session_id":"11111111-2222-3333-4444-555555555555"}]}"#,
+            ),
+        ]);
+        let mut cfg = test_config(&url, tmp.path());
+
+        // A state file with an entry this sweep will NOT confirm, which is
+        // exactly what a naive writeback would drop.
+        let mut existing = State::load(&cfg.state_file, &cfg.stamp_digest());
+        existing.mark(std::path::Path::new("/somewhere/else.jsonl"), "fp".into());
+        existing.save().unwrap();
+        let before = std::fs::read(&cfg.state_file).unwrap();
+
+        cfg.ignore_state = true;
+        run(&cfg).await.unwrap();
+
+        let after = std::fs::read(&cfg.state_file).unwrap();
+        assert_eq!(before, after, "an ignored sweep rewrote the state file");
+
+        // Byte equality alone could in principle hold by coincidence, so the
+        // property is also asserted semantically: the entry this sweep never
+        // confirmed is still there for the next normal run to use.
+        let reloaded = State::load(&cfg.state_file, &cfg.stamp_digest());
+        assert!(
+            reloaded.is_current(std::path::Path::new("/somewhere/else.jsonl"), "fp"),
+            "the unrelated entry a later run depends on was discarded"
+        );
     }
 
     #[tokio::test]

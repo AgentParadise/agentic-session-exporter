@@ -91,70 +91,179 @@ pub fn read_threads(
     read_threads_conn(&conn, origin, limit)
 }
 
+/// Explicit bounds on one streaming Cursor read, so peak memory does not grow
+/// with the number or size of threads in the database.
+#[derive(Debug, Clone, Copy)]
+pub struct ThreadBounds {
+    /// Most candidate threads held for ordering. Older threads beyond it are
+    /// reported as [`ThreadItem::Overflow`], never silently dropped.
+    pub max_threads: usize,
+    /// Most bytes of composer and bubble rows read for one thread. A larger
+    /// thread is reported as [`ThreadItem::Oversize`] without being assembled.
+    pub max_bytes: u64,
+}
+
+impl ThreadBounds {
+    pub const UNBOUNDED: Self = Self {
+        max_threads: usize::MAX,
+        max_bytes: u64::MAX,
+    };
+}
+
+/// One streamed Cursor item.
+pub enum ThreadItem {
+    Thread(Box<CursorThread>),
+    /// The composer key of a thread whose rows exceed the byte bound.
+    Oversize(String),
+    /// Number of threads left out by the count bound.
+    Overflow(u64),
+}
+
+/// Stream threads newest first, holding one assembled thread at a time.
+/// Returns the visitor's own error in the inner `Result`.
+pub fn visit_threads<E>(
+    db: &Path,
+    origin: &Origin,
+    limit: Option<usize>,
+    bounds: ThreadBounds,
+    visit: &mut dyn FnMut(ThreadItem) -> Result<(), E>,
+) -> Result<Result<(), E>, CursorError> {
+    let conn = open_immutable(db)?;
+    visit_threads_conn(&conn, origin, limit, bounds, visit)
+}
+
 /// Reconstruct threads from an already-open connection. Split out from
 /// `read_threads` so it is unit-testable against an in-memory DB (no file, no
-/// immutable-URI open) that mirrors the real `cursorDiskKV` shape. The prepare,
-/// scan, sort, reconstruction, and limit logic are all measured via the
-/// in-memory fixtures below (including a missing-table case that forces the
-/// prepare error arm).
+/// immutable-URI open) that mirrors the real `cursorDiskKV` shape.
 fn read_threads_conn(
     conn: &Connection,
     origin: &Origin,
     limit: Option<usize>,
 ) -> Result<Vec<CursorThread>, CursorError> {
-    // Pull every composerData row. We sort by createdAt DESC in Rust after
-    // parsing (the value is JSON, not a column), so we select all first.
+    let mut out = Vec::new();
+    let visited = visit_threads_conn(conn, origin, limit, ThreadBounds::UNBOUNDED, &mut |item| {
+        if let ThreadItem::Thread(thread) = item {
+            out.push(*thread);
+        }
+        Ok::<(), std::convert::Infallible>(())
+    })?;
+    let Ok(()) = visited;
+    Ok(out)
+}
+
+/// A candidate thread: ordering key, row order (for a stable tie-break),
+/// composer key, and whether its composer row alone is over the byte bound.
+type Candidate = (std::cmp::Reverse<i64>, usize, String, bool);
+
+/// Keep the newest `cap` candidates, returning how many were dropped.
+fn keep_newest(candidates: &mut Vec<Candidate>, cap: usize) -> u64 {
+    candidates.sort();
+    let dropped = candidates.len().saturating_sub(cap);
+    candidates.truncate(cap);
+    dropped as u64
+}
+
+/// Two passes. The first streams composer rows, reading only each row's size
+/// and `createdAt`, and keeps at most `max_threads` (key, time) candidates.
+/// The second fetches, assembles, and hands over one thread at a time.
+fn visit_threads_conn<E>(
+    conn: &Connection,
+    origin: &Origin,
+    limit: Option<usize>,
+    bounds: ThreadBounds,
+    visit: &mut dyn FnMut(ThreadItem) -> Result<(), E>,
+) -> Result<Result<(), E>, CursorError> {
+    #[derive(serde::Deserialize)]
+    struct Created {
+        #[serde(rename = "createdAt")]
+        created: Option<Value>,
+    }
     let mut stmt =
         conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
-    let rows = stmt
-        .query_map([], |row| {
-            let key: String = row.get(0)?;
-            // cursorDiskKV.value is stored as TEXT (the vast majority), BLOB, or
-            // NULL depending on Cursor's version. rusqlite's Vec<u8> reader rejects
-            // TEXT, so read the raw ValueRef and coerce TEXT/BLOB to bytes, mapping
-            // NULL (and any other type) to None so the row is skipped. `get_ref(1)`
-            // cannot error for this fixed in-range column index, so its
-            // (unreachable) Err folds into the same skip arm rather than an
-            // uncovered `?` edge.
-            let value: Option<Vec<u8>> = match row.get_ref(1) {
-                Ok(rusqlite::types::ValueRef::Text(b)) | Ok(rusqlite::types::ValueRef::Blob(b)) => {
-                    Some(b.to_vec())
-                }
-                _ => None,
-            };
-            Ok((key, value))
-        })
-        // A fixed SQL statement with no bound parameters can only fail to bind on
-        // a placeholder/param-count mismatch, i.e. a programming invariant, not a
-        // runtime error; there is no forceable error edge to exercise.
-        .expect("static composerData query has no parameters to bind");
-
-    // Collect (createdAt, composerData Value) so we can sort + cap.
-    let mut composers: Vec<(i64, Value)> = Vec::new();
-    for row in rows {
-        let (_key, value) = row?;
-        let Some(bytes) = value else { continue };
-        let Ok(cd) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
+    let mut rows = stmt.query([])?;
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut overflow = 0;
+    let mut seq = 0;
+    while let Some(row) = rows.next()? {
+        // cursorDiskKV.value is TEXT (the vast majority), BLOB, or NULL
+        // depending on Cursor's version. Borrow TEXT/BLOB bytes in place and
+        // skip anything else. `get_ref(1)` cannot fail for this fixed column.
+        let bytes = match row.get_ref(1) {
+            Ok(rusqlite::types::ValueRef::Text(b)) | Ok(rusqlite::types::ValueRef::Blob(b)) => b,
+            _ => continue,
         };
-        let created = cd.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0);
-        composers.push((created, cd));
-    }
-    // Newest first, so `limit` keeps the most recent threads.
-    composers.sort_by_key(|item| std::cmp::Reverse(item.0));
-
-    let mut out = Vec::new();
-    for (_created, cd) in composers {
-        if let Some(thread) = reconstruct(conn, &cd, origin)? {
-            out.push(thread);
-            if let Some(n) = limit {
-                if out.len() >= n {
-                    break;
-                }
-            }
+        let key: String = row.get(0)?;
+        seq += 1;
+        if bytes.len() as u64 > bounds.max_bytes {
+            candidates.push((std::cmp::Reverse(0), seq, key, true));
+        } else {
+            let Ok(created) = serde_json::from_slice::<Created>(bytes) else {
+                continue;
+            };
+            let created = created.created.and_then(|v| v.as_i64()).unwrap_or(0);
+            candidates.push((std::cmp::Reverse(created), seq, key, false));
+        }
+        if candidates.len() >= bounds.max_threads.saturating_mul(2).max(1024) {
+            overflow += keep_newest(&mut candidates, bounds.max_threads);
         }
     }
-    Ok(out)
+    drop(rows);
+    overflow += keep_newest(&mut candidates, bounds.max_threads);
+    if overflow > 0 {
+        if let Err(error) = visit(ThreadItem::Overflow(overflow)) {
+            return Ok(Err(error));
+        }
+    }
+
+    let mut emitted = 0;
+    for (_, _, key, oversize) in candidates {
+        if limit.is_some_and(|n| emitted >= n) {
+            break;
+        }
+        let item = if oversize {
+            ThreadItem::Oversize(key)
+        } else {
+            let value: Option<Vec<u8>> = conn.query_row(
+                "SELECT value FROM cursorDiskKV WHERE key=?1",
+                [&key],
+                |row| {
+                    Ok(match row.get_ref(0)? {
+                        rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) => {
+                            Some(b.to_vec())
+                        }
+                        _ => None,
+                    })
+                },
+            )?;
+            let Some((cd, size)) = value.and_then(|b| {
+                serde_json::from_slice::<Value>(&b)
+                    .ok()
+                    .map(|cd| (cd, b.len() as u64))
+            }) else {
+                continue;
+            };
+            let budget = bounds.max_bytes.saturating_sub(size);
+            match reconstruct(conn, &cd, origin, budget)? {
+                Assembled::Empty => continue,
+                Assembled::Oversize => ThreadItem::Oversize(key),
+                Assembled::Thread(thread) => ThreadItem::Thread(thread),
+            }
+        };
+        emitted += 1;
+        if let Err(error) = visit(item) {
+            return Ok(Err(error));
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// What reconstructing one composer produced.
+enum Assembled {
+    Thread(Box<CursorThread>),
+    /// No bubbles: nothing worth storing.
+    Empty,
+    /// Its bubble rows exceed the byte bound; nothing beyond it was loaded.
+    Oversize,
 }
 
 /// Build one envelope from a composerData value. Returns `None` for empty
@@ -164,20 +273,24 @@ fn reconstruct(
     conn: &Connection,
     cd: &Value,
     origin: &Origin,
-) -> Result<Option<CursorThread>, CursorError> {
+    budget: u64,
+) -> Result<Assembled, CursorError> {
     let composer_id = cd
         .get("composerId")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     if composer_id.is_empty() {
-        return Ok(None);
+        return Ok(Assembled::Empty);
     }
 
     // Gather bubbles in canonical order plus their plain text, verbatim.
-    let (bubble_values, texts, types) = collect_bubbles(conn, cd, &composer_id)?;
+    let Some((bubble_values, texts, types)) = collect_bubbles(conn, cd, &composer_id, budget)?
+    else {
+        return Ok(Assembled::Oversize);
+    };
     if bubble_values.is_empty() {
-        return Ok(None);
+        return Ok(Assembled::Empty);
     }
 
     let message_count = bubble_values.len() as u64;
@@ -250,20 +363,22 @@ fn reconstruct(
         raw,
     };
 
-    Ok(Some(CursorThread {
+    Ok(Assembled::Thread(Box::new(CursorThread {
         fingerprint,
         envelope,
-    }))
+    })))
 }
 
 /// Collect the thread's bubbles in canonical order, returning their verbatim
 /// JSON values, their plain `text`, and their `type` codes. Both layouts (inline
 /// and headers-only) are measured via the in-memory `read_threads` tests.
+/// `None` when separate bubble rows exceed `budget` bytes.
 fn collect_bubbles(
     conn: &Connection,
     cd: &Value,
     composer_id: &str,
-) -> Result<Bubbles, CursorError> {
+    budget: u64,
+) -> Result<Option<Bubbles>, CursorError> {
     let mut values = Vec::new();
     let mut texts = Vec::new();
     let mut types = Vec::new();
@@ -274,7 +389,7 @@ fn collect_bubbles(
             for b in conv {
                 push_bubble(b, &mut values, &mut texts, &mut types);
             }
-            return Ok((values, texts, types));
+            return Ok(Some((values, texts, types)));
         }
     }
 
@@ -286,7 +401,9 @@ fn collect_bubbles(
     {
         // Pre-load all bubble rows for this composer into a map for O(1) lookup,
         // so we do one scan instead of N point queries.
-        let bubble_map = load_bubble_rows(conn, composer_id)?;
+        let Some(bubble_map) = load_bubble_rows(conn, composer_id, budget)? else {
+            return Ok(None);
+        };
         for h in headers {
             let Some(bid) = h.get("bubbleId").and_then(|v| v.as_str()) else {
                 continue;
@@ -297,7 +414,7 @@ fn collect_bubbles(
         }
     }
 
-    Ok((values, texts, types))
+    Ok(Some((values, texts, types)))
 }
 
 /// Load every `bubbleId:<composerId>:<bubbleId>` row's JSON, keyed by bubbleId.
@@ -307,7 +424,8 @@ fn collect_bubbles(
 fn load_bubble_rows(
     conn: &Connection,
     composer_id: &str,
-) -> Result<HashMap<String, Value>, CursorError> {
+    budget: u64,
+) -> Result<Option<HashMap<String, Value>>, CursorError> {
     // Use a half-open range instead of `LIKE ?1`. A bound LIKE parameter defeats
     // SQLite's index on `key` (it cannot prove the pattern is a prefix at plan
     // time), forcing a full-table scan of ~178k rows PER thread: 1,282 threads
@@ -341,16 +459,21 @@ fn load_bubble_rows(
         // error.
         .expect("static bubbleId range query binds exactly its two parameters");
     let mut map = HashMap::new();
+    let mut total: u64 = 0;
     for row in rows {
         let (key, value) = row?;
         let Some(bytes) = value else { continue };
+        total = total.saturating_add(bytes.len() as u64);
+        if total > budget {
+            return Ok(None);
+        }
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
         let bid = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
         map.insert(bid, v);
     }
-    Ok(map)
+    Ok(Some(map))
 }
 
 /// Append one bubble's verbatim value + extracted text + type.
@@ -874,7 +997,7 @@ mod tests {
         // first, so it is exercised at the helper level).
         let conn = Connection::open_in_memory().unwrap();
         assert_eq!(
-            cursor_err_kind(&load_bubble_rows(&conn, "CID").err().unwrap()),
+            cursor_err_kind(&load_bubble_rows(&conn, "CID", u64::MAX).err().unwrap()),
             "query"
         );
     }
@@ -954,5 +1077,102 @@ mod tests {
         assert_eq!(metadata.model, None);
         assert_eq!(metadata.project, None);
         assert_eq!(metadata.repo, None);
+    }
+
+    #[test]
+    fn streaming_bounds_report_overflow_and_oversize_and_keep_the_newest() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+        )
+        .unwrap();
+        let insert = |key: String, value: String| {
+            conn.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .unwrap();
+        };
+        for index in 0..2_000i64 {
+            insert(
+                format!("composerData:c{index}"),
+                json!({"composerId": format!("c{index}"), "createdAt": index,
+                    "conversation": [{"bubbleId": "b", "type": 1, "text": "hi"}]})
+                .to_string(),
+            );
+        }
+        // A composer row over the byte bound on its own, a thread whose
+        // bubble rows push it over, and rows that are not threads at all.
+        insert(
+            "composerData:huge".into(),
+            format!("{{\"pad\":\"{}\"}}", "x".repeat(600)),
+        );
+        insert(
+            "composerData:split".into(),
+            json!({"composerId": "split", "createdAt": 9_999,
+                "fullConversationHeadersOnly": [{"bubbleId": "a"}]})
+            .to_string(),
+        );
+        insert(
+            "bubbleId:split:a".into(),
+            json!({"type": 1, "text": "y".repeat(400)}).to_string(),
+        );
+        insert("composerData:broken".into(), "{".into());
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:null', NULL)",
+            [],
+        )
+        .unwrap();
+        let bounds = ThreadBounds {
+            max_threads: 10,
+            max_bytes: 500,
+        };
+        let mut seen = Vec::new();
+        let result = visit_threads_conn(&conn, &origin(), None, bounds, &mut |item| {
+            seen.push(match item {
+                ThreadItem::Thread(t) => t.envelope.session_id.clone(),
+                ThreadItem::Oversize(key) => format!("oversize {key}"),
+                ThreadItem::Overflow(count) => format!("overflow {count}"),
+            });
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert!(result.is_ok());
+        // 2,002 candidates (the broken and null rows are not threads), 10
+        // kept: split (newest), then c1999 down to c1991.
+        // The oversize composer row sorts oldest and is dropped by the bound.
+        let mut expected = vec![
+            "overflow 1992".to_string(),
+            "oversize composerData:split".into(),
+        ];
+        expected.extend((1991..2000).rev().map(|i| format!("c{i}")));
+        assert_eq!(seen, expected);
+
+        // The limit counts what is emitted; the oversize row surfaces when
+        // nothing newer crowds it out; a visitor error stops the sweep.
+        let roomy = ThreadBounds {
+            max_threads: 5_000,
+            max_bytes: 500,
+        };
+        let mut oversize = 0;
+        visit_threads_conn(&conn, &origin(), None, roomy, &mut |item| {
+            oversize += usize::from(matches!(item, ThreadItem::Oversize(_)));
+            Ok::<(), ()>(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(oversize, 2);
+        let mut count = 0;
+        visit_threads_conn(&conn, &origin(), Some(3), roomy, &mut |_| {
+            count += 1;
+            Ok::<(), ()>(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 3);
+        let stopped = visit_threads_conn(&conn, &origin(), None, roomy, &mut |_| Err("stop"));
+        assert!(matches!(stopped, Ok(Err("stop"))));
+        let stopped = visit_threads_conn(&conn, &origin(), None, bounds, &mut |_| Err("stop"));
+        assert!(matches!(stopped, Ok(Err("stop"))));
     }
 }

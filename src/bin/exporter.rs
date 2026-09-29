@@ -5,6 +5,7 @@
 //!   --loop SECONDS     run forever, sweeping every SECONDS (the daemon mode).
 //!   --health           report the age of the last successful sweep and exit.
 //!   --dry-run          discover + count only; no network, no state writes.
+//!   --ignore-state     do not read the state file; re-send everything found.
 //!   --cursor-limit N   cap the run to the newest N Cursor threads (alias
 //!                      --limit N). Mainly for a fast bounded test against a
 //!                      large real Cursor DB. Overrides the CURSOR_LIMIT env.
@@ -39,6 +40,16 @@ enum Command {
     Health,
     DryRun,
     RunOnce,
+    Spool,
+    InventoryEnqueue,
+    InventoryDrain(usize),
+    CaptureEnqueue,
+    CaptureDelete,
+    EnvelopeHash,
+    CaptureReceipt,
+    CaptureDrain(usize),
+    SpoolList(u64, Option<u64>),
+    SpoolRead(u64),
     Loop(u64),
 }
 
@@ -51,26 +62,41 @@ struct Invocation {
     /// line. A consumer that has to regex prose is coupled to wording nothing
     /// tests; this is the supported machine interface.
     json: bool,
+    /// Do not READ the state file, so nothing it contains can influence the
+    /// result. For a caller auditing a process that can write it.
+    ignore_state: bool,
 }
 
 /// A usage error. Always reported on stderr and always exit code 2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ArgError {
     UnknownFlag(String),
+    InvalidSpoolArguments,
     UnexpectedArgument(String),
     /// `--json` given with a mode that has no JSON result to emit.
     JsonUnsupportedMode,
+    /// `--ignore-state` given with a mode where it would mislead or do nothing.
+    IgnoreStateUnsupportedMode,
 }
 
 impl std::fmt::Display for ArgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidSpoolArguments => {
+                write!(f, "invalid or conflicting local spool arguments")
+            }
             Self::UnknownFlag(flag) => write!(f, "unknown flag: {flag}"),
             Self::UnexpectedArgument(arg) => write!(f, "unexpected argument: {arg}"),
             Self::JsonUnsupportedMode => write!(
                 f,
                 "--json applies to a capture sweep only; it cannot be combined \
                  with --health, --dry-run or --loop"
+            ),
+            Self::IgnoreStateUnsupportedMode => write!(
+                f,
+                "--ignore-state applies to a capture sweep; --health reads the \
+                 health sidecar, which it does not protect, and --dry-run never \
+                 consults state at all"
             ),
         }
     }
@@ -96,7 +122,12 @@ const EXIT_INCOMPLETE: i32 = 3;
 /// Version of the `--json` payload shape. Bump on any incompatible change, so
 /// a consumer can refuse a shape it does not understand instead of
 /// misreading it.
-const RESULT_SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 when `sessions` was added to the success document.
+///
+/// A consumer that requires session-level confirmation must check this: on
+/// schema 1 the absence of `sessions` means "this exporter cannot tell you",
+/// not "nothing was confirmed".
+const RESULT_SCHEMA_VERSION: u32 = 2;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -124,6 +155,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_usage();
             return Ok(());
         }
+        Command::EnvelopeHash => return run_envelope_hash(),
+        Command::InventoryEnqueue | Command::InventoryDrain(_) => {
+            return run_inventory(invocation.command).await;
+        }
+        Command::CaptureEnqueue
+        | Command::CaptureReceipt
+        | Command::CaptureDelete
+        | Command::CaptureDrain(_) => {
+            return run_capture_delivery(invocation.command).await;
+        }
+        Command::SpoolList(after, through) => {
+            let spool = agentic_session_exporter::spool::LocalSpool::open_readonly(&spool_root()?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&spool.page(after, through, 500)?)?
+            );
+            return Ok(());
+        }
+        Command::SpoolRead(sequence) => {
+            use std::io::Write;
+            let spool = agentic_session_exporter::spool::LocalSpool::open_readonly(&spool_root()?)?;
+            let limit = std::env::var("MAX_ENVELOPE_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(512 * 1024 * 1024);
+            std::io::stdout().write_all(&spool.read(sequence, limit)?)?;
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -134,7 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
     );
-    if invocation.json {
+    if invocation.json || matches!(invocation.command, Command::Spool) {
         subscriber.with_writer(std::io::stderr).init();
     } else {
         subscriber.init();
@@ -145,7 +205,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // stdout would otherwise get an empty stream, which reads as "no result"
     // rather than "this exporter is misconfigured". The store URL is unknown
     // here by definition, so it is reported as null rather than invented.
-    let mut cfg = match Config::from_env() {
+    let configuration = if matches!(invocation.command, Command::Spool) {
+        Config::from_env_local()
+    } else {
+        Config::from_env()
+    };
+    let mut cfg = match configuration {
         Ok(cfg) => cfg,
         Err(e) => {
             if invocation.json {
@@ -155,13 +220,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     // A CLI --cursor-limit / --limit overrides the CURSOR_LIMIT env value.
+    cfg.ignore_state = invocation.ignore_state;
     if let Some(n) = invocation.cursor_limit {
         cfg.cursor_limit = Some(n);
     }
 
     match invocation.command {
         // Handled above, before config was loaded.
-        Command::Version | Command::Help => unreachable!("version/help returned before config"),
+        Command::Version
+        | Command::Help
+        | Command::EnvelopeHash
+        | Command::SpoolList(_, _)
+        | Command::SpoolRead(_)
+        | Command::InventoryEnqueue
+        | Command::InventoryDrain(_)
+        | Command::CaptureEnqueue
+        | Command::CaptureReceipt
+        | Command::CaptureDelete
+        | Command::CaptureDrain(_) => {
+            unreachable!("read-only commands returned before config")
+        }
         Command::Health => return run_health_check(&cfg),
         Command::DryRun => {
             let found = discover_all(&cfg)?;
@@ -176,6 +254,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|| "(none)".into()),
             );
             return Ok(());
+        }
+        Command::Spool => {
+            let summary = agentic_session_exporter::spool::capture_local(&cfg, &spool_root()?)?;
+            println!("{}", serde_json::to_string(&summary)?);
+            if summary.skipped_oversize > 0 || summary.skipped_overflow > 0 {
+                std::process::exit(EXIT_INCOMPLETE);
+            }
         }
         Command::RunOnce => {
             // A hard failure must still produce a document under --json.
@@ -234,6 +319,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn parse_spool_cursor(value: &str) -> Result<(u64, Option<u64>), ArgError> {
+    let (after, through) = value
+        .split_once(':')
+        .map_or((value, None), |(a, b)| (a, Some(b)));
+    let after = after.parse().map_err(|_| ArgError::InvalidSpoolArguments)?;
+    let through = through
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| ArgError::InvalidSpoolArguments)?;
+    Ok((after, through))
+}
+
+fn spool_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let value = std::env::var_os("EXPORTER_SPOOL_DIR").ok_or(
+        agentic_session_exporter::config::ConfigError::Missing("EXPORTER_SPOOL_DIR"),
+    )?;
+    let root = std::path::PathBuf::from(value);
+    if !root.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "EXPORTER_SPOOL_DIR must be absolute",
+        )
+        .into());
+    }
+    Ok(root)
+}
+
 fn print_usage() {
     println!(
         "\
@@ -262,19 +374,51 @@ Options:
                      contract. Applies to a capture sweep ONLY: combining it
                      with --health, --dry-run or --loop is a usage error
                      rather than a silently empty stream.
+  --ignore-state     do not READ or WRITE the state file, so nothing it
+                     contains can
+                     influence the result. Every discovered session is sent
+                     again; a conforming store deduplicates on
+                     (session_id, content_hash), so the cost is a request
+                     rather than a duplicate row. For a caller auditing a
+                     process that can WRITE that file - anything able to do
+                     so can otherwise make a transcript that never reached
+                     the store report as skipped_unchanged, which reads as a
+                     clean sweep.
 
 Exit codes for a capture sweep:
   0                  every session found reached the store (or was already
                      there, or was unchanged).
   {EXIT_INCOMPLETE}                  the sweep RAN but did not capture everything it
-                     found: something was rejected, oversize, or failed.
+                     found: something was rejected, oversize, unconfirmed
+                     (sent, but the store returned no matching outcome), or
+                     failed.
                      Exit 0 alone therefore does not prove a given session
                      was stored; check this code, or read --json.
   1                  the sweep could not run (store unreachable, scan failure).
   {EXIT_USAGE}                  usage error.
 
+Local capture (no SESSION_STORE_URL or token needed):
+  --spool-only        archive one sweep into EXPORTER_SPOOL_DIR; emit JSON counts.
+  --spool-list N[:W] list at most 500 revisions after N, frozen through watermark W.
+  --spool-read N      write the exact archived SCS envelope for sequence N.
+EXPORTER_SPOOL_DIR must name an absolute persistent directory. Local counts
+report this sweep's discovered files, never independent capture completeness.
+
+Inventory replication (always emits JSON):
+  --capture-enqueue   durably queue one qualified envelope from stdin (at most 64 MiB).
+  --envelope-hash     validate and hash an envelope on stdin without configuration or storage.
+  --capture-delete    durably queue exact qualified revision deletion from stdin (at most 16 KiB).
+  --capture-receipt   look up a committed receipt for the qualified envelope on stdin.
+  --capture-drain N   retry at most N qualified captures (1..50); exit 3 if any remain
+                      or any are quarantined.
+  --inventory-enqueue accept one operation JSON from stdin (at most 2 MiB).
+  --inventory-drain N retry at most N pending operations (1..500); exit 3 if any remain
+                      or any are quarantined.
+Requires SESSION_STORE_URL, INVENTORY_WRITE_TOKEN and absolute EXPORTER_INVENTORY_DIR.
+Enqueue persists locally without network access. Drain is separate from capture.
+
 Configuration comes from the environment (SESSION_STORE_URL is required for
-every mode except --version and --help). Unrecognized arguments exit {EXIT_USAGE}.",
+remote modes, except --version and --help). Unrecognized arguments exit {EXIT_USAGE}.",
         bin = env!("CARGO_BIN_NAME"),
         version = env!("CARGO_PKG_VERSION"),
     );
@@ -291,7 +435,9 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
     let mut health = false;
     let mut dry_run = false;
     let mut json = false;
+    let mut ignore_state = false;
     let mut loop_secs: Option<u64> = None;
+    let mut spool_mode: Option<Command> = None;
     let mut cursor_limit: Option<usize> = None;
 
     let mut i = 0;
@@ -314,8 +460,76 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
                 dry_run = true;
                 i += 1;
             }
+            "--envelope-hash" | "--capture-enqueue" | "--capture-receipt" | "--capture-delete"
+            | "--capture-drain" => {
+                let (selected, consumed) = if arg == "--capture-enqueue" {
+                    (Command::CaptureEnqueue, 1)
+                } else if arg == "--envelope-hash" {
+                    (Command::EnvelopeHash, 1)
+                } else if arg == "--capture-delete" {
+                    (Command::CaptureDelete, 1)
+                } else if arg == "--capture-receipt" {
+                    (Command::CaptureReceipt, 1)
+                } else {
+                    let (value, consumed) = take_value(args, i);
+                    let limit = value
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|v| (1..=50).contains(v))
+                        .ok_or(ArgError::InvalidSpoolArguments)?;
+                    (Command::CaptureDrain(limit), consumed)
+                };
+                if spool_mode.replace(selected).is_some() {
+                    return Err(ArgError::InvalidSpoolArguments);
+                }
+                i += consumed;
+            }
+            "--inventory-enqueue" | "--inventory-drain" => {
+                let (selected, consumed) = if arg == "--inventory-enqueue" {
+                    (Command::InventoryEnqueue, 1)
+                } else {
+                    let (value, consumed) = take_value(args, i);
+                    let limit = value
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|v| (1..=500).contains(v))
+                        .ok_or(ArgError::InvalidSpoolArguments)?;
+                    (Command::InventoryDrain(limit), consumed)
+                };
+                if spool_mode.replace(selected).is_some() {
+                    return Err(ArgError::InvalidSpoolArguments);
+                }
+                i += consumed;
+            }
+            "--spool-only" => {
+                if spool_mode.replace(Command::Spool).is_some() {
+                    return Err(ArgError::InvalidSpoolArguments);
+                }
+                i += 1;
+            }
+            "--spool-list" | "--spool-read" => {
+                let (value, consumed) = take_value(args, i);
+                let value = value.ok_or(ArgError::InvalidSpoolArguments)?;
+                let selected = if arg == "--spool-list" {
+                    let (after, through) = parse_spool_cursor(value)?;
+                    Command::SpoolList(after, through)
+                } else {
+                    let sequence = value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|number| *number > 0)
+                        .ok_or(ArgError::InvalidSpoolArguments)?;
+                    Command::SpoolRead(sequence)
+                };
+                if spool_mode.replace(selected).is_some() {
+                    return Err(ArgError::InvalidSpoolArguments);
+                }
+                i += consumed;
+            }
             "--json" => {
                 json = true;
+                i += 1;
+            }
+            "--ignore-state" => {
+                ignore_state = true;
                 i += 1;
             }
             "--loop" => {
@@ -344,10 +558,19 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
         }
     }
 
+    if !version
+        && !help
+        && spool_mode.is_some()
+        && (health || dry_run || loop_secs.is_some() || ignore_state || cursor_limit.is_some())
+    {
+        return Err(ArgError::InvalidSpoolArguments);
+    }
     let command = if version {
         Command::Version
     } else if help {
         Command::Help
+    } else if let Some(local) = spool_mode {
+        local
     } else if health {
         Command::Health
     } else if dry_run {
@@ -369,16 +592,37 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
     if json
         && matches!(
             command,
-            Command::Health | Command::DryRun | Command::Loop(_)
+            Command::Health
+                | Command::DryRun
+                | Command::Loop(_)
+                | Command::EnvelopeHash
+                | Command::CaptureEnqueue
+                | Command::CaptureReceipt
+                | Command::CaptureDelete
+                | Command::CaptureDrain(_)
         )
     {
         return Err(ArgError::JsonUnsupportedMode);
+    }
+
+    // --ignore-state is about a CAPTURE verdict, and pairs badly with two modes:
+    //
+    //   --health   reads the health sidecar, which the audited process can
+    //              forge under exactly the threat model this flag exists for.
+    //              Accepting it would hand back a reassuring answer from a
+    //              source the flag does not protect - a false assurance is
+    //              worse than a usage error.
+    //   --dry-run  never consults state at all, so the flag would be a silent
+    //              no-op, and a caller who believed it mattered would be wrong.
+    if ignore_state && matches!(command, Command::Health | Command::DryRun) {
+        return Err(ArgError::IgnoreStateUnsupportedMode);
     }
 
     Ok(Invocation {
         command,
         cursor_limit,
         json,
+        ignore_state,
     })
 }
 
@@ -412,7 +656,8 @@ fn render_result_json(summary: &RunSummary, cfg: &Config) -> String {
             r#"{{"schema_version":{},"scs_version":"{}","captured_everything":{},"#,
             r#""store_url":"{}","origin":{{"environment":"{}","deployment":{}}},"#,
             r#""counters":{{"discovered":{},"skipped_unchanged":{},"uploaded":{},"#,
-            r#""accepted":{},"duplicate":{},"rejected":{},"skipped_oversize":{},"failed":{},"unconfirmed":{}}}}}"#
+            r#""accepted":{},"duplicate":{},"rejected":{},"skipped_oversize":{},"failed":{},"unconfirmed":{}}},"#,
+            r#""sessions":{}}}"#
         ),
         RESULT_SCHEMA_VERSION,
         escape_json(SCS_VERSION),
@@ -429,7 +674,28 @@ fn render_result_json(summary: &RunSummary, cfg: &Config) -> String {
         summary.skipped_oversize,
         summary.failed,
         summary.unconfirmed,
+        render_confirmed_sessions(&summary.confirmed_sessions),
     )
+}
+
+/// The confirmed session ids as a JSON array of strings.
+///
+/// Emitted so a caller can ask whether the session IT cares about reached the
+/// store, rather than only whether some number of sessions did. Counters alone
+/// let a sweep that captured an unrelated decoy report the same success as one
+/// that captured the session the caller was asking about.
+fn render_confirmed_sessions(ids: &[String]) -> String {
+    let mut out = String::from("[");
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&escape_json(id));
+        out.push('"');
+    }
+    out.push(']');
+    out
 }
 
 /// The `--json` payload for a sweep that could not run at all.
@@ -542,9 +808,254 @@ fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
+fn run_envelope_hash() -> Result<(), Box<dyn std::error::Error>> {
+    use agentic_session_exporter::capture_outbox::CaptureOutboxError;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(64 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err(CaptureOutboxError::Invalid.into());
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| CaptureOutboxError::Invalid)?;
+    let value = session_capture::content_hash::parse_ijson(text)
+        .map_err(|_| CaptureOutboxError::Invalid)?;
+    let mut envelope: session_capture::SessionEnvelope =
+        serde_json::from_value(value).map_err(|_| CaptureOutboxError::Invalid)?;
+    envelope.content_hash = None;
+    envelope
+        .validate()
+        .map_err(|_| CaptureOutboxError::Invalid)?;
+    let hash =
+        session_capture::content_hash_for(&envelope).map_err(|_| CaptureOutboxError::Invalid)?;
+    println!(
+        "{}",
+        serde_json::json!({"schema_version":1,"content_hash":hash})
+    );
+    Ok(())
+}
+
+async fn run_capture_delivery(command: Command) -> Result<(), Box<dyn std::error::Error>> {
+    use agentic_session_exporter::{
+        capture_outbox::{CaptureOutbox, CaptureOutboxError},
+        qualified_capture::QualifiedCaptureClient,
+    };
+    use std::io::Read;
+    let required = |name| {
+        std::env::var(name)
+            .map_err(|_| agentic_session_exporter::config::ConfigError::Missing(name))
+    };
+    let client = QualifiedCaptureClient::new(
+        &required("SESSION_STORE_URL")?,
+        required("CAPTURE_WRITE_TOKEN")?,
+    )?;
+    let root = std::path::PathBuf::from(required("EXPORTER_CAPTURE_DIR")?);
+    if !root.is_absolute() {
+        return Err(CaptureOutboxError::Invalid.into());
+    }
+    let mut outbox = CaptureOutbox::open(&root, &client)?;
+    if matches!(command, Command::CaptureDelete) {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Deletion {
+            identity: session_capture::inventory::QualifiedTranscript,
+            content_hash: String,
+        }
+        let mut bytes = Vec::new();
+        std::io::stdin().take(16385).read_to_end(&mut bytes)?;
+        if bytes.len() > 16384 {
+            return Err(CaptureOutboxError::Invalid.into());
+        }
+        let request: Deletion =
+            serde_json::from_slice(&bytes).map_err(|_| CaptureOutboxError::Invalid)?;
+        let inserted = outbox.enqueue_deletion(&request.identity, &request.content_hash)?;
+        println!(
+            "{}",
+            serde_json::json!({"schema_version":1,"inserted":inserted})
+        );
+        return Ok(());
+    }
+
+    match command {
+        Command::CaptureEnqueue | Command::CaptureReceipt => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Request {
+                identity: session_capture::inventory::QualifiedTranscript,
+                envelope: session_capture::SessionEnvelope,
+            }
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(64 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 64 * 1024 * 1024 {
+                return Err(CaptureOutboxError::Invalid.into());
+            }
+            let text = std::str::from_utf8(&bytes).map_err(|_| CaptureOutboxError::Invalid)?;
+            let value = session_capture::content_hash::parse_ijson(text)
+                .map_err(|_| CaptureOutboxError::Invalid)?;
+            let request: Request =
+                serde_json::from_value(value).map_err(|_| CaptureOutboxError::Invalid)?;
+            if matches!(command, Command::CaptureReceipt) {
+                let mut envelope = request.envelope;
+                envelope.content_hash = None;
+                envelope
+                    .validate()
+                    .map_err(|_| CaptureOutboxError::Invalid)?;
+                if request.identity.native_session_id() != envelope.session_id {
+                    return Err(CaptureOutboxError::Invalid.into());
+                }
+                let hash = session_capture::content_hash_for(&envelope)
+                    .map_err(|_| CaptureOutboxError::Invalid)?;
+                let receipt = outbox.receipt(&request.identity, &hash)?;
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"receipt":receipt})
+                );
+                return Ok(());
+            }
+            let inserted = outbox.enqueue(&request.identity, &request.envelope)?;
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1,"inserted":inserted})
+            );
+        }
+        Command::CaptureDrain(limit) => {
+            let summary = outbox.drain(&client, limit).await?;
+            println!("{}", serde_json::to_string(&summary)?);
+            // Quarantined rows will never deliver on their own, so a pass that
+            // leaves any behind is incomplete even with nothing else pending.
+            if summary.remaining > 0 || summary.quarantined > 0 {
+                std::process::exit(EXIT_INCOMPLETE);
+            }
+        }
+        _ => unreachable!("capture delivery mode required"),
+    }
+    Ok(())
+}
+
+async fn run_inventory(command: Command) -> Result<(), Box<dyn std::error::Error>> {
+    use agentic_session_exporter::{
+        inventory::InventoryClient,
+        inventory_outbox::{InventoryOperation, InventoryOutbox},
+    };
+    use std::io::Read;
+    let required = |name| {
+        std::env::var(name)
+            .map_err(|_| agentic_session_exporter::config::ConfigError::Missing(name))
+    };
+    let client = InventoryClient::new(
+        &required("SESSION_STORE_URL")?,
+        required("INVENTORY_WRITE_TOKEN")?,
+    )?;
+    let root = std::path::PathBuf::from(required("EXPORTER_INVENTORY_DIR")?);
+    if !root.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "EXPORTER_INVENTORY_DIR must be absolute",
+        )
+        .into());
+    }
+    let outbox = InventoryOutbox::open(&root, &client)?;
+    match command {
+        Command::InventoryEnqueue => {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(2 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 2 * 1024 * 1024 {
+                return Err(
+                    agentic_session_exporter::inventory_outbox::OutboxError::Invalid.into(),
+                );
+            }
+            let operation: InventoryOperation = serde_json::from_slice(&bytes)
+                .map_err(|_| agentic_session_exporter::inventory_outbox::OutboxError::Invalid)?;
+            let inserted = outbox.enqueue(&operation)?;
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1, "inserted":inserted})
+            );
+        }
+        Command::InventoryDrain(limit) => {
+            let summary = outbox.drain(&client, limit).await?;
+            println!("{}", serde_json::to_string(&summary)?);
+            // Quarantined rows will never deliver on their own, so a pass that
+            // leaves any behind is incomplete even with nothing else pending.
+            if summary.remaining > 0 || summary.quarantined > 0 {
+                std::process::exit(EXIT_INCOMPLETE);
+            }
+        }
+        _ => unreachable!("inventory mode required"),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Config good enough to render a result document against.
+    ///
+    /// Only the fields the renderer reads matter here (store url, origin), but
+    /// the struct has no Default, so the rest are filled with inert values.
+    fn test_cfg() -> Config {
+        Config {
+            store_url: "http://store.example:8797".to_string(),
+            write_token: None,
+            origin_host: "host-a".to_string(),
+            origin_environment: "container".to_string(),
+            origin_deployment: Some("syntropic137__development".to_string()),
+            claude_root: std::path::PathBuf::from("/nonexistent/claude"),
+            codex_root: std::path::PathBuf::from("/nonexistent/codex"),
+            cursor_db: None,
+            cursor_limit: None,
+            state_file: std::path::PathBuf::from("/nonexistent/state.json"),
+            ignore_state: true,
+            health_file: std::path::PathBuf::from("/nonexistent/health.json"),
+            health_max_age_secs: 3600,
+            batch_size: 50,
+            max_envelope_bytes: 1024 * 1024,
+            tags: Vec::new(),
+        }
+    }
+
+    /// The WIRE CONTRACT, parsed as JSON rather than string-matched.
+    ///
+    /// The unit tests around `render_confirmed_sessions` call that helper
+    /// directly, so they stay green even if its output is never placed into the
+    /// document. A mutation check caught exactly that: renaming the `sessions`
+    /// key out of `render_result_json` left every test passing. This asserts on
+    /// the parsed document, which is what a consumer actually reads.
+    #[test]
+    fn the_result_document_carries_the_confirmed_sessions() {
+        let mut s = summary(0, 0, 0);
+        s.confirmed_sessions = vec!["a".to_string(), r#"b"c"#.to_string(), "a".to_string()];
+
+        let doc = render_result_json(&s, &test_cfg());
+        let v: serde_json::Value =
+            serde_json::from_str(&doc).expect("the result document must be valid JSON");
+
+        assert_eq!(v["schema_version"], 2);
+        assert_eq!(
+            v["sessions"],
+            serde_json::json!(["a", "b\"c", "a"]),
+            "the document must name every confirmed session, duplicates included"
+        );
+    }
+
+    #[test]
+    fn a_sweep_that_confirmed_nothing_still_emits_an_array() {
+        // Not null and not absent: a consumer that has to branch on presence
+        // cannot tell "confirmed nothing" from "this exporter cannot tell you",
+        // and those mean very different things during a version rollout.
+        let mut s = summary(0, 0, 0);
+        s.confirmed_sessions = Vec::new();
+
+        let doc = render_result_json(&s, &test_cfg());
+        let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
+        assert_eq!(v["sessions"], serde_json::json!([]));
+    }
 
     fn parse(args: &[&str]) -> Result<Invocation, ArgError> {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
@@ -566,6 +1077,7 @@ mod tests {
             skipped_oversize: oversize,
             failed,
             unconfirmed: 0,
+            confirmed_sessions: vec!["sess-a".to_string()],
         }
     }
 
@@ -656,6 +1168,7 @@ mod tests {
             skipped_oversize: 0,
             failed: 0,
             unconfirmed: 0,
+            confirmed_sessions: vec!["sess-a".to_string(), "sess-b".to_string()],
         };
         assert!(captured_everything(&s));
     }
@@ -672,10 +1185,43 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_sessions_render_as_a_json_string_array() {
+        assert_eq!(render_confirmed_sessions(&[]), "[]");
+        assert_eq!(render_confirmed_sessions(&["a".to_string()]), r#"["a"]"#);
+        assert_eq!(
+            render_confirmed_sessions(&["a".to_string(), "b".to_string()]),
+            r#"["a","b"]"#
+        );
+    }
+
+    #[test]
+    fn a_confirmed_session_id_is_escaped_like_every_other_string() {
+        // Session ids come from transcript filenames, which the audited agent
+        // controls. An unescaped quote here would let it inject arbitrary keys
+        // into the result document the host parses.
+        assert_eq!(
+            render_confirmed_sessions(&[r#"a"b"#.to_string()]),
+            r#"["a\"b"]"#
+        );
+    }
+
+    #[test]
+    fn the_same_session_id_can_be_confirmed_more_than_once() {
+        // A multiset, mirroring the confirmation logic: two envelopes can share
+        // a session id while differing in content, and each confirmation covers
+        // exactly one of them. Collapsing them would overstate what was stored.
+        assert_eq!(
+            render_confirmed_sessions(&["a".to_string(), "a".to_string()]),
+            r#"["a","a"]"#
+        );
+    }
+
+    #[test]
     fn no_args_is_a_single_run() {
         assert_eq!(
             parse(&[]).unwrap(),
             Invocation {
+                ignore_state: false,
                 command: Command::RunOnce,
                 cursor_limit: None,
                 json: false,
@@ -693,6 +1239,36 @@ mod tests {
     fn help_long_and_short_forms_parse() {
         assert_eq!(command(&["--help"]), Command::Help);
         assert_eq!(command(&["-h"]), Command::Help);
+    }
+
+    #[test]
+    fn ignore_state_is_rejected_where_it_would_mislead() {
+        // --health reads the health sidecar, which the audited process can
+        // forge under the same threat model this flag exists for; --dry-run
+        // never consults state, so the flag would be a silent no-op. Both are
+        // usage errors rather than quiet false assurance.
+        assert_eq!(
+            parse(&["--ignore-state", "--health"]),
+            Err(ArgError::IgnoreStateUnsupportedMode)
+        );
+        assert_eq!(
+            parse(&["--ignore-state", "--dry-run"]),
+            Err(ArgError::IgnoreStateUnsupportedMode)
+        );
+    }
+
+    #[test]
+    fn ignore_state_is_accepted_for_a_capture_sweep() {
+        assert!(parse(&["--ignore-state"]).unwrap().ignore_state);
+        assert!(parse(&["--ignore-state", "--json"]).unwrap().ignore_state);
+        // --loop is a repeated capture sweep, so it is meaningful there.
+        assert!(
+            parse(&["--ignore-state", "--loop", "5"])
+                .unwrap()
+                .ignore_state
+        );
+        // Absent by default: only a caller that asks pays the re-send.
+        assert!(!parse(&[]).unwrap().ignore_state);
     }
 
     #[test]

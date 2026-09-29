@@ -29,6 +29,16 @@ pub struct State {
     seen: HashMap<String, String>,
     path: PathBuf,
     config_digest: String,
+    /// False for a state that must not be written back.
+    ///
+    /// An "ignored" state starts empty, so saving it would REPLACE a real
+    /// file with only what this one sweep confirmed - discarding entries for
+    /// sessions that were rejected, filtered, undiscovered, or simply not
+    /// reached. A later normal run would then resend all of them. That is a
+    /// cache loss rather than a transcript loss, and it fails in the
+    /// conservative direction, but a flag documented as "do not read the
+    /// file" has no business rewriting it.
+    persist: bool,
 }
 
 impl State {
@@ -45,6 +55,29 @@ impl State {
             seen,
             path: path.to_path_buf(),
             config_digest: config_digest.to_string(),
+            persist: true,
+        }
+    }
+
+    /// Load NOTHING, so every discovered session is re-sent.
+    ///
+    /// For a caller that must not let the state file influence the verdict.
+    /// The file records which transcripts this exporter believes it already
+    /// sent, and `skipped_unchanged` is derived from it - so anything able to
+    /// write it can make a transcript that never reached the store read as a
+    /// clean sweep. Where the file lives in a directory the audited process
+    /// can write, protecting it is not possible; not consulting it is.
+    ///
+    /// Re-sending costs a request. A conforming store deduplicates on
+    /// (session_id, content_hash), so it is a no-op there, and a verdict that
+    /// cannot be forged is worth more than the bytes.
+    pub fn ignoring(path: &Path, config_digest: &str) -> Self {
+        Self {
+            seen: HashMap::new(),
+            path: path.to_path_buf(),
+            config_digest: config_digest.to_string(),
+            // Neither read NOR written. See `persist`.
+            persist: false,
         }
     }
 
@@ -65,6 +98,12 @@ impl State {
     /// Persist state to disk. Creates the parent directory if needed. Errors are
     /// returned but treated as non-fatal by the caller.
     pub fn save(&self) -> std::io::Result<()> {
+        // A state that was never read must not be written. Ok, not an error:
+        // callers treat a save failure as worth logging, and there is nothing
+        // wrong here - there is simply nothing to persist.
+        if !self.persist {
+            return Ok(());
+        }
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
