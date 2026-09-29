@@ -1,10 +1,13 @@
 # Qualified capture delivery
 
-This draft pins APSS commit `d8924a557cfb114534f4cdb69ed1535f0eec4c8f`
-from [APSS PR #139](https://github.com/AgentParadise/agent-paradise-standards-system/pull/139).
-The lockfile resolves that public commit without local path overrides. Replace
-the Git dependency with the published APSS 2.1 package before release; the
-coordinated standard release and consumer release gates remain required.
+This pins APSS commit `d8924a557cfb114534f4cdb69ed1535f0eec4c8f`
+from [APSS PR #139](https://github.com/AgentParadise/agent-paradise-standards-system/pull/139),
+which is merged and reachable from APSS `main` (the crate declares 2.1.0 there).
+The lockfile resolves that public commit without local path overrides, and
+v0.6.0 is built from it: the release ships binaries and an OCI image, not a
+crates.io package. APSS 2.1 is not on crates.io yet; switching to the registry
+package once it is published is tracked in
+[#27](https://github.com/AgentParadise/agentic-session-exporter/issues/27).
 
 The optional `QualifiedCaptureClient` uploads a standard envelope to
 `POST /v1/transcripts` with its source installation, harness, and native ID.
