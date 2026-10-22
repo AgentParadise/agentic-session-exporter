@@ -914,11 +914,19 @@ mod tests {
         let mut summary = RunSummary::default();
         let budget = estimated_len(&envelope("big", 1000)) / 2;
         let sent_when_loaded = std::sync::Mutex::new(Vec::new());
-        let items = loaded(&pending(&[("big", 1000), ("b", 1), ("c", 1)]), false)
+        // Each envelope is built only when the stream pulls it, as a real load
+        // is, and records how many batches had been sent at that moment.
+        let items = [("big", 1000), ("b", 1), ("c", 1)]
             .into_iter()
-            .inspect(|_| {
+            .map(|(id, filler)| {
                 let sent = sender.batches.lock().unwrap().len();
                 sent_when_loaded.lock().unwrap().push(sent);
+                Ok(Some(Item {
+                    path: PathBuf::from(format!("/state/{id}")),
+                    fingerprint: format!("fp-{id}"),
+                    is_cursor: false,
+                    envelope: envelope(id, filler),
+                }))
             });
         upload_stream(&sender, limits(50, budget), items, &mut state, &mut summary)
             .await

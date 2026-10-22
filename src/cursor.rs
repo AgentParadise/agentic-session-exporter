@@ -142,9 +142,12 @@ impl CursorDb {
 /// `json_*` call runs on `CAST(value AS TEXT)`: on a BLOB, SQLite 3.45+ would
 /// otherwise try to read the bytes as JSONB, while serde reads them as JSON text.
 ///
-/// The key range (`>= 'composerData:' AND < 'composerData;'`) uses the
-/// UNIQUE(key) index; the full reader's `LIKE` cannot (LIKE is case-insensitive
-/// by default). The rowid is returned so `scan_conn` can restore the full
+/// The full reader selects `key LIKE 'composerData:%'`, which is
+/// case-insensitive and so cannot use the UNIQUE(key) index: a full table scan.
+/// The same `LIKE` is kept here, so exactly the same rows match, but behind two
+/// index ranges that cover every ASCII case variant of the prefix in BINARY
+/// order (those starting `C`, then those starting `c`), so only keys in those
+/// ranges are visited and the filter runs on the index entry alone. The rowid is returned so `scan_conn` can restore the full
 /// reader's rowid (table-scan) order in Rust, so a `limit` breaks `createdAt`
 /// ties identically. There is deliberately no `ORDER BY`: SQLite would sort
 /// every projected row, header lists included, in a temp B-tree, holding them
@@ -192,10 +195,21 @@ SELECT
 FROM (
   SELECT rowid AS rid, key, CAST(value AS TEXT) AS v
   FROM cursorDiskKV
-  WHERE key >= 'composerData:' AND key < 'composerData;'
+  WHERE ((key >= 'COMPOSERDATA:' AND key < 'Composerdata;')
+      OR (key >= 'cOMPOSERDATA:' AND key < 'composerdata;'))
+    AND key LIKE 'composerData:%'
     AND typeof(value) IN ('text', 'blob')
 )
 WHERE CASE WHEN json_valid(v) THEN json_type(v) END = 'object'";
+
+/// The full reader's first-pass probe of a composer row: only `createdAt`, for
+/// ordering. A row this rejects (not JSON, or a duplicated `createdAt`) is not a
+/// thread to the full reader.
+#[derive(serde::Deserialize)]
+struct Created {
+    #[serde(rename = "createdAt")]
+    created: Option<Value>,
+}
 
 /// One scanned composerData row, before the (possibly bubble-row-backed)
 /// message count is known.
@@ -271,11 +285,45 @@ fn scan_conn(
     // createdAt, then table-scan i.e. rowid order), so `limit` keeps the same
     // threads.
     scanned.sort_by_key(|(created, rowid, _)| (std::cmp::Reverse(*created), *rowid));
-    Ok(scanned
-        .into_iter()
-        .take(limit.unwrap_or(usize::MAX))
-        .map(|(_, _, t)| t)
-        .collect())
+    let Some(limit) = limit else {
+        return Ok(scanned.into_iter().map(|(_, _, t)| t).collect());
+    };
+    // Under a limit, a row SQLite accepts but serde rejects (see SCAN_SQL) must
+    // not take a slot: the full reader skips it and fills the slot with the next
+    // thread, and a run would otherwise load nothing for that slot and never
+    // capture the thread that belongs there. Only the selected rows are probed,
+    // one composer value at a time.
+    let mut kept = Vec::with_capacity(limit.min(scanned.len()));
+    for (_, _, thread) in scanned {
+        if kept.len() >= limit {
+            break;
+        }
+        if serde_accepts(conn, &thread.key)? {
+            kept.push(thread);
+        }
+    }
+    Ok(kept)
+}
+
+/// Whether the full reader would read the composer row at `key` as a thread at
+/// all: its `createdAt` probe and its full JSON parse both succeed.
+fn serde_accepts(conn: &Connection, key: &str) -> Result<bool, CursorError> {
+    let accepted = conn
+        .query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = ?1",
+            [key],
+            |row| {
+                Ok(match row.get_ref(0)? {
+                    ValueRef::Text(b) | ValueRef::Blob(b) => {
+                        serde_json::from_slice::<Created>(b).is_ok()
+                            && serde_json::from_slice::<Value>(b).is_ok()
+                    }
+                    _ => false,
+                })
+            },
+        )
+        .optional()?;
+    Ok(accepted.unwrap_or(false))
 }
 
 /// The number of bubbles `collect_bubbles` would gather, without gathering them.
@@ -453,11 +501,6 @@ fn visit_threads_conn<E>(
     bounds: ThreadBounds,
     visit: &mut dyn FnMut(ThreadItem) -> Result<(), E>,
 ) -> Result<Result<(), E>, CursorError> {
-    #[derive(serde::Deserialize)]
-    struct Created {
-        #[serde(rename = "createdAt")]
-        created: Option<Value>,
-    }
     let mut stmt =
         conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
     let mut rows = stmt.query([])?;
@@ -1657,6 +1700,65 @@ mod tests {
         }
         assert_eq!(get("renamed"), Some("13:1"));
         assert_eq!(full.len(), 12);
+    }
+
+    /// Rows the full reader's case-insensitive `LIKE` matches under another
+    /// case, and rows only SQLite accepts, newest of all: a limited scan still
+    /// selects exactly the full reader's threads; an unlimited one may list the
+    /// SQLite-only rows too, which then load as nothing.
+    #[test]
+    fn limited_scans_select_the_full_readers_threads_despite_divergent_rows() {
+        let conn = scan_fixture();
+        let c = &conn;
+        put_text(
+            c,
+            "ComposerData:upper",
+            r#"{"composerId":"upper","createdAt":14,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "COMPOSERDATA:shout",
+            r#"{"composerId":"shout","createdAt":15,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:huge-num",
+            r#"{"composerId":"huge-num","createdAt":1000,"x":1e999,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:dup-created",
+            r#"{"composerId":"dup-created","createdAt":999,"createdAt":998,"conversation":[1]}"#,
+        );
+        // Outside the prefix in any case: never a thread.
+        put_text(
+            c,
+            "composerDataX:no",
+            r#"{"composerId":"no","createdAt":2000,"conversation":[1]}"#,
+        );
+        let full = full_pairs(&conn, None);
+        assert!(full.iter().any(|(id, _)| id == "upper"));
+        assert!(full.iter().any(|(id, _)| id == "shout"));
+        assert!(!full.iter().any(|(id, _)| id == "no"));
+        for n in 1..=full.len() + 1 {
+            assert_eq!(
+                scan_pairs(&conn, Some(n)),
+                full_pairs(&conn, Some(n)),
+                "limit {n}"
+            );
+        }
+        let unlimited: Vec<String> = scan_pairs(&conn, None)
+            .into_iter()
+            .filter(|pair| !full.contains(pair))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(unlimited, vec!["huge-num", "dup-created"]);
+        assert!(load_conn(&conn, "composerData:huge-num", &origin())
+            .unwrap()
+            .is_none());
+        // A probe of a row that vanished, or is not text, accepts nothing.
+        assert!(!serde_accepts(&conn, "composerData:gone").unwrap());
+        assert!(!serde_accepts(&conn, "composerData:null").unwrap());
     }
 
     /// The scan's SQL leans on specific behaviour of the bundled SQLite's JSON
