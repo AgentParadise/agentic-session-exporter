@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::parsers::{read_claude, read_codex, ParseError};
 use session_capture::{Origin, SessionEnvelope};
 
+use crate::cursor::CursorDb;
 use crate::gitmeta;
 
 /// A discovered transcript plus a change fingerprint.
@@ -255,11 +256,28 @@ pub fn visit_claude<E>(
         let native_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         read_claude(bytes, native_id, origin.clone())
     };
-    walk(
-        root,
-        &|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"),
-        &mut |path| visit_file(path, limit, &parse, warn_skip_claude, visit),
-    )
+    walk(root, &is_claude_transcript, &mut |path| {
+        visit_file(path, limit, &parse, warn_skip_claude, visit)
+    })
+}
+
+/// A Claude Code transcript: any `.jsonl` file under the projects root.
+fn is_claude_transcript(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+}
+
+/// A Codex rollout transcript: `rollout-*.jsonl`.
+fn is_codex_rollout(path: &Path) -> bool {
+    is_claude_transcript(path)
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("rollout-"))
+}
+
+/// The session id a Codex rollout falls back to when its payload has none.
+fn codex_fallback_id(stem: &str) -> &str {
+    stem.strip_prefix("rollout-").unwrap_or(stem)
 }
 
 /// Discover Codex rollout transcripts under `root` (`~/.codex/sessions`).
@@ -277,19 +295,11 @@ pub fn visit_codex<E>(
 ) -> Result<(), VisitError<E>> {
     let parse = |path: &Path, bytes: &[u8]| {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let fallback_id = stem.strip_prefix("rollout-").unwrap_or(stem);
-        read_codex(bytes, fallback_id, origin.clone())
+        read_codex(bytes, codex_fallback_id(stem), origin.clone())
     };
-    walk(
-        root,
-        &|p| {
-            p.extension().and_then(|s| s.to_str()) == Some("jsonl")
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("rollout-"))
-        },
-        &mut |path| visit_file(path, limit, &parse, warn_skip_codex, visit),
-    )
+    walk(root, &is_codex_rollout, &mut |path| {
+        visit_file(path, limit, &parse, warn_skip_codex, visit)
+    })
 }
 
 /// The synthetic per-thread path a Cursor thread is keyed by.
@@ -325,6 +335,188 @@ pub fn discover_cursor(
         });
     }
     Ok(out)
+}
+
+// --- scan, then load -------------------------------------------------------
+//
+// The capture run splits discovery in two so it never materialises a transcript
+// it is about to skip:
+//
+//   - SCAN (`scan_claude` / `scan_codex` / `scan_cursor`) yields a lightweight
+//     `Candidate { path, fingerprint, kind }` per transcript. Claude / Codex
+//     scans read file metadata only (no file reads); the Cursor scan computes
+//     each thread's fingerprint inside SQLite (see `crate::cursor`).
+//   - LOAD (`load`) reads, parses and enriches ONE candidate into an envelope.
+//     The run only loads candidates whose fingerprint is not current in the
+//     state file, one at a time, so peak memory is one upload batch rather than
+//     the whole corpus.
+//
+// The fingerprints are the same strings the `discover_*` readers produce, so a
+// state file written by an earlier build stays valid.
+
+/// Which source a candidate came from, plus what `load` needs to fetch it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceKind {
+    Claude,
+    Codex,
+    /// A Cursor thread, loaded by its composer row key from the run's open
+    /// `CursorDb`.
+    Cursor {
+        key: String,
+    },
+}
+
+/// A transcript found by a cheap scan: enough to decide whether to load it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// State key: the absolute transcript path, or for Cursor the synthetic
+    /// `<db_path>#composer:<composerId>` (see [`cursor_path`]).
+    pub path: PathBuf,
+    /// Claude / Codex: `<mtime_secs>:<size>`. Cursor: `<updated|created>:<count>`.
+    pub fingerprint: String,
+    pub kind: SourceKind,
+}
+
+/// A loaded candidate: its envelope plus the fingerprint to record in state.
+/// For Claude / Codex that is the one taken AT READ TIME (the file may have
+/// changed since the scan; marking the read-time value never records content
+/// that was not sent). For Cursor it is the scan fingerprint (see `load`).
+pub struct Loaded {
+    pub fingerprint: String,
+    pub envelope: SessionEnvelope,
+}
+
+/// Scan Claude Code transcripts under `root` (`~/.claude/projects`): every
+/// `<sessionUuid>.jsonl` (including nested subagent transcripts), in path order.
+/// Metadata only; no file is read.
+pub fn scan_claude(root: &Path) -> Result<Vec<Candidate>, SourceError> {
+    scan_files(root, &is_claude_transcript, SourceKind::Claude)
+}
+
+/// Scan Codex rollout transcripts under `root` (`~/.codex/sessions`): only
+/// `rollout-*.jsonl` files (possibly nested under YYYY/MM/DD), in path order.
+/// Metadata only.
+pub fn scan_codex(root: &Path) -> Result<Vec<Candidate>, SourceError> {
+    scan_files(root, &is_codex_rollout, SourceKind::Codex)
+}
+
+/// Walk `root`, keep matching files in path order (the order the collected
+/// `discover_*` form has always used), and fingerprint each from its metadata.
+/// A file that vanishes between the walk and its `stat` is dropped, as a
+/// vanished file is skipped by `read_transcript`.
+fn scan_files(
+    root: &Path,
+    keep: &dyn Fn(&Path) -> bool,
+    kind: SourceKind,
+) -> Result<Vec<Candidate>, SourceError> {
+    let mut files = Vec::new();
+    walk::<std::convert::Infallible>(root, keep, &mut |path| {
+        files.push(path);
+        Ok(())
+    })
+    .map_err(|error| match error {
+        VisitError::Source(error) => error,
+        VisitError::Visitor(never) => match never {},
+    })?;
+    files.sort();
+    Ok(files
+        .into_iter()
+        .filter_map(|path| {
+            let fingerprint = fingerprint_of(&std::fs::metadata(&path).ok()?);
+            Some(Candidate {
+                path,
+                fingerprint,
+                kind: kind.clone(),
+            })
+        })
+        .collect())
+}
+
+/// Scan Cursor chat threads from an open state DB, newest first, capped at the
+/// newest `limit` non-empty threads. Each maps to the same synthetic state key
+/// and `<lastUpdatedAt|createdAt>:<message_count>` fingerprint as
+/// [`discover_cursor`], without reconstructing any thread.
+pub fn scan_cursor(
+    cursor: &CursorDb,
+    db: &Path,
+    limit: Option<usize>,
+) -> Result<Vec<Candidate>, SourceError> {
+    Ok(cursor
+        .scan(limit)?
+        .into_iter()
+        .map(|t| Candidate {
+            path: cursor_path(db, &t.composer_id),
+            fingerprint: t.fingerprint,
+            kind: SourceKind::Cursor { key: t.key },
+        })
+        .collect())
+}
+
+/// Load one candidate into an enriched envelope.
+///
+/// `Ok(None)` skips the candidate without marking it, exactly as discovery
+/// skips it: the file vanished or became unreadable, it is empty, it failed to
+/// parse (warned), or the Cursor thread vanished or reconstructs empty. A
+/// Cursor candidate with no open `cursor` is also skipped (it cannot arise from
+/// a run, which only scans Cursor through that DB). `Err` is reserved for a
+/// Cursor query failure, which aborts the run as a Cursor read failure always
+/// has.
+pub fn load(
+    candidate: &Candidate,
+    origin: &Origin,
+    cursor: Option<&CursorDb>,
+) -> Result<Option<Loaded>, SourceError> {
+    match &candidate.kind {
+        SourceKind::Claude => Ok(load_file(
+            &candidate.path,
+            warn_skip_claude,
+            |bytes, stem| read_claude(bytes, stem, origin.clone()),
+        )),
+        SourceKind::Codex => Ok(load_file(
+            &candidate.path,
+            warn_skip_codex,
+            |bytes, stem| read_codex(bytes, codex_fallback_id(stem), origin.clone()),
+        )),
+        SourceKind::Cursor { key } => {
+            let Some(cursor) = cursor else {
+                return Ok(None);
+            };
+            // Mark the SCAN fingerprint, not `reconstruct`'s. They are equal
+            // except for the SQLite/serde divergences listed on
+            // `cursor::SCAN_SQL`; for those, marking the value the next scan
+            // computes keeps the thread from re-sending on every run.
+            Ok(cursor.load(key, origin)?.map(|t| Loaded {
+                fingerprint: candidate.fingerprint.clone(),
+                envelope: t.envelope,
+            }))
+        }
+    }
+}
+
+/// Read + parse + enrich one transcript file, unbounded, as `discover_*` does.
+/// `parse` receives the bytes and the file stem.
+fn load_file(
+    path: &Path,
+    warn: fn(&Path, &ParseError),
+    parse: impl Fn(&[u8], &str) -> Result<SessionEnvelope, ParseError>,
+) -> Option<Loaded> {
+    // A vanished or unreadable file is skipped; an unbounded read is never
+    // Oversize.
+    let Some(Transcript::Bytes(fingerprint, bytes)) = read_transcript(path, u64::MAX) else {
+        return None;
+    };
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    match parse(&bytes, stem) {
+        Ok(env) => Some(Loaded {
+            fingerprint,
+            envelope: enrich(env),
+        }),
+        Err(ParseError::Empty) => None,
+        Err(e) => {
+            warn(path, &e);
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -719,5 +911,140 @@ mod tests {
         write(&root.join("-a").join("notes.txt"), "ignored");
         let found = discover_claude(&root, &origin()).unwrap();
         assert_eq!(found.len(), 1);
+    }
+
+    // --- scan, then load ------------------------------------------------------
+
+    /// Scan + load every candidate, as a capture run with empty state would.
+    fn scan_and_load(
+        candidates: Vec<Candidate>,
+        cursor: Option<&CursorDb>,
+    ) -> Vec<(PathBuf, String, String)> {
+        candidates
+            .into_iter()
+            .filter_map(|c| {
+                load(&c, &origin(), cursor)
+                    .unwrap()
+                    .map(|l| (c.path, l.fingerprint, l.envelope.session_id))
+            })
+            .collect()
+    }
+
+    fn discovered(found: Vec<Discovered>) -> Vec<(PathBuf, String, String)> {
+        found
+            .into_iter()
+            .map(|d| (d.path, d.fingerprint, d.envelope.session_id))
+            .collect()
+    }
+
+    #[test]
+    fn scan_then_load_finds_what_discovery_finds_with_the_same_fingerprints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("projects");
+        let user = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        write(&claude.join("-b").join("22222222.jsonl"), user);
+        write(&claude.join("-a").join("11111111.jsonl"), user);
+        // Empty and malformed transcripts scan as candidates but never load,
+        // exactly as discovery skips them.
+        write(&claude.join("-a").join("empty.jsonl"), "");
+        write(&claude.join("-a").join("bad.jsonl"), "not json\n");
+        std::fs::write(claude.join("-a").join("utf8.jsonl"), [0xff, 0xfe]).unwrap();
+        write(&claude.join("-a").join("notes.txt"), user);
+        let scanned = scan_claude(&claude).unwrap();
+        assert_eq!(scanned.len(), 5);
+        assert!(scanned.iter().all(|c| c.kind == SourceKind::Claude));
+        assert_eq!(
+            scan_and_load(scanned, None),
+            discovered(discover_claude(&claude, &origin()).unwrap())
+        );
+
+        let codex = tmp.path().join("sessions");
+        let rollout = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"from-payload\"}}\n";
+        write(&codex.join("2026/07/02").join("rollout-b.jsonl"), rollout);
+        write(&codex.join("2026/07/01").join("rollout-a.jsonl"), rollout);
+        write(&codex.join("2026/07/01").join("other.jsonl"), rollout);
+        let scanned = scan_codex(&codex).unwrap();
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(
+            scan_and_load(scanned, None),
+            discovered(discover_codex(&codex, &origin()).unwrap())
+        );
+
+        // A missing root scans as empty; a root that is a file is an error.
+        assert!(scan_claude(&tmp.path().join("absent")).unwrap().is_empty());
+        let file = tmp.path().join("a-file");
+        write(&file, "x");
+        assert!(scan_codex(&file).is_err());
+    }
+
+    #[test]
+    fn scan_fingerprint_is_the_read_time_fingerprint_for_an_unchanged_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        write(
+            &root.join("-a").join("11111111.jsonl"),
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        );
+        let scanned = scan_claude(&root).unwrap();
+        let loaded = load(&scanned[0], &origin(), None).unwrap().unwrap();
+        assert_eq!(loaded.fingerprint, scanned[0].fingerprint);
+    }
+
+    #[test]
+    fn a_file_that_vanishes_after_the_scan_is_skipped_at_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        let f = root.join("rollout-abc.jsonl");
+        write(&f, "{\"type\":\"response_item\"}\n");
+        let scanned = scan_codex(&root).unwrap();
+        std::fs::remove_file(&f).unwrap();
+        assert!(load(&scanned[0], &origin(), None).unwrap().is_none());
+    }
+
+    #[test]
+    fn cursor_scan_then_load_matches_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("state.vscdb");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cursorDiskKV (key TEXT UNIQUE, value BLOB);
+             INSERT INTO cursorDiskKV VALUES ('composerData:a',
+               '{\"composerId\":\"a\",\"createdAt\":1,\"conversation\":[{\"text\":\"x\"}]}');
+             INSERT INTO cursorDiskKV VALUES ('composerData:b',
+               '{\"composerId\":\"b\",\"createdAt\":2,\"lastUpdatedAt\":3,
+                 \"fullConversationHeadersOnly\":[{\"bubbleId\":\"h\"}]}');
+             INSERT INTO cursorDiskKV VALUES ('bubbleId:b:h', '{\"text\":\"y\"}');
+             INSERT INTO cursorDiskKV VALUES ('composerData:empty',
+               '{\"composerId\":\"empty\",\"createdAt\":4,\"conversation\":[]}');",
+        )
+        .unwrap();
+        drop(conn);
+        let cursor = CursorDb::open(&db).unwrap();
+        for limit in [None, Some(1), Some(2), Some(5)] {
+            let scanned = scan_cursor(&cursor, &db, limit).unwrap();
+            assert_eq!(
+                scan_and_load(scanned, Some(&cursor)),
+                discovered(discover_cursor(&db, &origin(), limit).unwrap()),
+                "limit {limit:?}"
+            );
+        }
+        let scanned = scan_cursor(&cursor, &db, None).unwrap();
+        assert_eq!(scanned[0].path, cursor_path(&db, "b"));
+        assert_eq!(scanned[0].fingerprint, "3:1");
+        // A Cursor candidate with no open DB (not something a run produces) is
+        // skipped rather than guessed at.
+        assert!(load(&scanned[0], &origin(), None).unwrap().is_none());
+        // A Cursor read failure at load time is an error, not a skip.
+        let broken = Candidate {
+            kind: SourceKind::Cursor {
+                key: "composerData:b".into(),
+            },
+            ..scanned[0].clone()
+        };
+        let empty = rusqlite::Connection::open(tmp.path().join("empty.vscdb")).unwrap();
+        drop(empty);
+        let no_table = CursorDb::open(&tmp.path().join("empty.vscdb")).unwrap();
+        assert!(load(&broken, &origin(), Some(&no_table)).is_err());
+        assert!(scan_cursor(&no_table, &db, None).is_err());
     }
 }

@@ -29,11 +29,12 @@
 //! The DB is opened READ-ONLY / immutable (`?immutable=1`): Cursor may be running
 //! and hold a write lock, and we must never write to it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 use serde_json::{json, Value};
 
 use session_capture::{Metadata, Origin, SessionEnvelope, SCS_VERSION};
@@ -75,6 +76,285 @@ fn open_immutable(db: &Path) -> Result<Connection, CursorError> {
     .map_err(|e| CursorError::Open {
         path: db.display().to_string(),
         source: e,
+    })
+}
+
+/// Read a column as an i64 only when SQLite returned an INTEGER. Mirrors serde's
+/// `as_i64`: `json_extract` yields REAL for fractions, exponents and integers
+/// beyond i64, and TEXT for strings, none of which `as_i64` accepts either.
+fn int_col(row: &Row<'_>, idx: usize) -> Option<i64> {
+    match row.get_ref(idx) {
+        Ok(ValueRef::Integer(n)) => Some(n),
+        _ => None,
+    }
+}
+
+/// Read a column as an owned UTF-8 string only when SQLite returned TEXT. Invalid
+/// UTF-8 maps to None, matching serde (which rejects the whole value).
+fn text_col(row: &Row<'_>, idx: usize) -> Option<String> {
+    match row.get_ref(idx) {
+        Ok(ValueRef::Text(b)) => std::str::from_utf8(b).ok().map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// One thread's cheap change token, computed without materialising the thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadFingerprint {
+    /// The `cursorDiskKV` key of the thread's composer row, which `load` reads.
+    pub key: String,
+    /// The thread's `composerId`, which is its session id and state key.
+    pub composer_id: String,
+    /// Byte-identical to the `CursorThread::fingerprint` that `reconstruct`
+    /// produces for the same row, so state files written by the full reader
+    /// stay valid and nothing is re-sent on upgrade.
+    pub fingerprint: String,
+}
+
+/// An open, immutable Cursor DB, held for one run so the cheap scan and the
+/// per-thread loads share a single connection.
+pub struct CursorDb {
+    conn: Connection,
+}
+
+impl CursorDb {
+    /// Open `db` read-only and immutable (never written).
+    pub fn open(db: &Path) -> Result<Self, CursorError> {
+        Ok(Self {
+            conn: open_immutable(db)?,
+        })
+    }
+
+    /// Fingerprint every non-empty thread (newest `limit` by `createdAt`)
+    /// without pulling thread values into Rust. See `scan_conn`.
+    pub fn scan(&self, limit: Option<usize>) -> Result<Vec<ThreadFingerprint>, CursorError> {
+        scan_conn(&self.conn, limit)
+    }
+
+    /// Fully reconstruct ONE thread from its composer row `key`. `None` when the
+    /// row vanished, is not valid JSON, or reconstructs to an empty thread.
+    pub fn load(&self, key: &str, origin: &Origin) -> Result<Option<CursorThread>, CursorError> {
+        load_conn(&self.conn, key, origin)
+    }
+}
+
+/// Per-thread fields the scan pulls out with SQLite's JSON functions. Every
+/// `json_*` call runs on `CAST(value AS TEXT)`: on a BLOB, SQLite 3.45+ would
+/// otherwise try to read the bytes as JSONB, while serde reads them as JSON text.
+///
+/// The key range (`>= 'composerData:' AND < 'composerData;'`) uses the
+/// UNIQUE(key) index; the full reader's `LIKE` cannot (LIKE is case-insensitive
+/// by default). The rowid is returned so `scan_conn` can restore the full
+/// reader's rowid (table-scan) order in Rust, so a `limit` breaks `createdAt`
+/// ties identically. There is deliberately no `ORDER BY`: SQLite would sort
+/// every projected row, header lists included, in a temp B-tree, holding them
+/// all at once. `json_type(v)` sits inside a `CASE WHEN json_valid(v)` so it is
+/// never evaluated on malformed text (where it would raise instead of returning
+/// NULL). Each typed column is NULL unless the JSON field has exactly the type
+/// serde's accessor accepts. For the timestamps that means a JSON integer that
+/// fits i64 (`json_extract` returns REAL beyond that, which `int_col` rejects)
+/// and is not the token `-0`, which SQLite calls an integer but serde parses as
+/// a float (`as_i64` = None).
+///
+/// The header list is only extracted when the inline `conversation` is not a
+/// non-empty array, the one case `message_count` needs it.
+///
+/// Known, accepted divergences between SQLite's JSON reader and serde (none
+/// present in the real DB, where every thread's scan fingerprint equals the
+/// full reader's). SQLite accepts, where serde rejects: numbers beyond f64 range
+/// (`1e999`), lone UTF-16 surrogate escapes, invalid UTF-8 inside strings, and
+/// nesting deeper than serde's 128-level limit. SQLite also keeps the FIRST of
+/// duplicate object keys where serde keeps the last (and the full reader's
+/// `createdAt` probe rejects a duplicated `createdAt` outright). Consequences:
+///   - a composerData value only SQLite accepts scans as a candidate but loads
+///     as `None`: skipped and unmarked, so it is reloaded (and skipped) on every
+///     run that is not gated;
+///   - a bubble value only SQLite accepts, or a duplicate key, makes the scan's
+///     fingerprint differ from `reconstruct`'s. Cursor marks the SCAN
+///     fingerprint (see `sources::load`), so this does not re-send every run,
+///     but a later repair that leaves `lastUpdatedAt` and the scanned count
+///     unchanged stays invisible, the same blindness the fingerprint already
+///     has to in-place bubble edits.
+const SCAN_SQL: &str = "\
+SELECT
+  key,
+  CASE json_type(v, '$.composerId') WHEN 'text' THEN json_extract(v, '$.composerId') END,
+  CASE WHEN json_type(v, '$.createdAt') = 'integer' AND (v -> '$.createdAt') <> '-0'
+    THEN json_extract(v, '$.createdAt') END,
+  CASE WHEN json_type(v, '$.lastUpdatedAt') = 'integer' AND (v -> '$.lastUpdatedAt') <> '-0'
+    THEN json_extract(v, '$.lastUpdatedAt') END,
+  CASE json_type(v, '$.conversation') WHEN 'array' THEN json_array_length(v, '$.conversation') ELSE 0 END,
+  CASE
+    WHEN json_type(v, '$.conversation') = 'array' AND json_array_length(v, '$.conversation') > 0 THEN NULL
+    WHEN json_type(v, '$.fullConversationHeadersOnly') = 'array' THEN json_extract(v, '$.fullConversationHeadersOnly')
+  END,
+  rid
+FROM (
+  SELECT rowid AS rid, key, CAST(value AS TEXT) AS v
+  FROM cursorDiskKV
+  WHERE key >= 'composerData:' AND key < 'composerData;'
+    AND typeof(value) IN ('text', 'blob')
+)
+WHERE CASE WHEN json_valid(v) THEN json_type(v) END = 'object'";
+
+/// One scanned composerData row, before the (possibly bubble-row-backed)
+/// message count is known.
+struct ScannedRow {
+    key: String,
+    composer_id: Option<String>,
+    created_ms: Option<i64>,
+    updated_ms: Option<i64>,
+    inline_len: i64,
+    headers: Option<String>,
+    rowid: i64,
+}
+
+/// Cheap scan: the per-thread fingerprint `reconstruct` would produce, computed
+/// without materialising any thread.
+///
+/// Why: the full reader parses every `composerData` value (and every bubble of
+/// every headers-only thread), which a capture run then throws ~99.5% away as
+/// unchanged. Here SQLite extracts only the handful of scalar fields the
+/// fingerprint depends on; the only JSON parsed in Rust is a headers-only
+/// thread's small header list. Bubble validity is checked in SQL, returning
+/// keys, never values.
+fn scan_conn(
+    conn: &Connection,
+    limit: Option<usize>,
+) -> Result<Vec<ThreadFingerprint>, CursorError> {
+    let mut stmt = conn.prepare(SCAN_SQL)?;
+    let rows = stmt
+        .query_map([], |row| {
+            // Decoding the key as a String keeps the full reader's behaviour: a
+            // composerData key that is not UTF-8 aborts the read.
+            Ok(ScannedRow {
+                key: row.get(0)?,
+                composer_id: text_col(row, 1),
+                created_ms: int_col(row, 2),
+                updated_ms: int_col(row, 3),
+                inline_len: int_col(row, 4).unwrap_or(0),
+                headers: text_col(row, 5),
+                rowid: int_col(row, 6).unwrap_or(0),
+            })
+        })
+        // A fixed SQL statement with no bound parameters can only fail to bind on
+        // a placeholder/param-count mismatch, a programming invariant.
+        .expect("static composerData scan has no parameters to bind");
+
+    // Count each thread while iterating, so at most one header list is alive at
+    // a time; only a small (createdAt, rowid, fingerprint) triple per non-empty
+    // thread is kept for the sort. `reconstruct` skips an empty composerId
+    // before anything else, and an empty thread (count 0) is dropped before
+    // `limit` applies, exactly as the full reader does.
+    let mut scanned: Vec<(i64, i64, ThreadFingerprint)> = Vec::new();
+    for row in rows {
+        let row = row?;
+        let Some(composer_id) = row.composer_id.filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let count = message_count(conn, &composer_id, row.inline_len, row.headers.as_deref())?;
+        if count == 0 {
+            continue;
+        }
+        let updated = row.updated_ms.or(row.created_ms).unwrap_or(0);
+        scanned.push((
+            row.created_ms.unwrap_or(0),
+            row.rowid,
+            ThreadFingerprint {
+                key: row.key,
+                fingerprint: format!("{updated}:{count}"),
+                composer_id,
+            },
+        ));
+    }
+    // Same newest-first order as `visit_threads_conn` (its candidates sort on
+    // createdAt, then table-scan i.e. rowid order), so `limit` keeps the same
+    // threads.
+    scanned.sort_by_key(|(created, rowid, _)| (std::cmp::Reverse(*created), *rowid));
+    Ok(scanned
+        .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|(_, _, t)| t)
+        .collect())
+}
+
+/// The number of bubbles `collect_bubbles` would gather, without gathering them.
+/// A non-empty inline `conversation` counts every element; otherwise each header
+/// with a string `bubbleId` counts once per header (duplicates included, as
+/// `push_bubble` does) when its bubble row is non-NULL valid JSON.
+fn message_count(
+    conn: &Connection,
+    composer_id: &str,
+    inline_len: i64,
+    headers: Option<&str>,
+) -> Result<u64, CursorError> {
+    if inline_len > 0 {
+        return Ok(inline_len as u64);
+    }
+    // SQLite already validated the header array, so serde accepts it; a parse
+    // failure (not observed) would count as zero, like a missing header list.
+    let Some(headers) = headers.and_then(|h| serde_json::from_str::<Vec<Value>>(h).ok()) else {
+        return Ok(0);
+    };
+    let valid = valid_bubble_ids(conn, composer_id)?;
+    Ok(headers
+        .iter()
+        .filter_map(|h| h.get("bubbleId").and_then(|v| v.as_str()))
+        .filter(|bid| valid.contains(*bid))
+        .count() as u64)
+}
+
+/// bubbleIds whose `bubbleId:<composerId>:<bubbleId>` row holds non-NULL valid
+/// JSON, i.e. exactly the keys `load_bubble_rows` would keep. Only keys leave
+/// SQLite; `json_valid` reads each value in place. Same half-open key range as
+/// `load_bubble_rows` (index range scan, no cross-thread leakage).
+fn valid_bubble_ids(conn: &Connection, composer_id: &str) -> Result<HashSet<String>, CursorError> {
+    let prefix = format!("bubbleId:{composer_id}:");
+    let upper = format!("bubbleId:{composer_id};");
+    let mut stmt = conn.prepare_cached(
+        "SELECT key FROM cursorDiskKV WHERE key >= ?1 AND key < ?2 \
+         AND typeof(value) IN ('text', 'blob') AND json_valid(CAST(value AS TEXT))",
+    )?;
+    let rows = stmt
+        .query_map([&prefix, &upper], |row| row.get::<_, String>(0))
+        // Two bound string parameters against two `?N` placeholders.
+        .expect("static bubbleId key query binds exactly its two parameters");
+    let mut ids = HashSet::new();
+    for key in rows {
+        let key = key?;
+        ids.insert(key.strip_prefix(&prefix).unwrap_or(&key).to_string());
+    }
+    Ok(ids)
+}
+
+/// Fetch one composerData row by key and reconstruct it, unbounded, exactly as
+/// the full reader does. The row is the only thread value materialised, so a
+/// run holds at most one thread at a time.
+fn load_conn(
+    conn: &Connection,
+    key: &str,
+    origin: &Origin,
+) -> Result<Option<CursorThread>, CursorError> {
+    let bytes = conn
+        .query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = ?1",
+            [key],
+            |row| {
+                Ok(match row.get_ref(0)? {
+                    ValueRef::Text(b) | ValueRef::Blob(b) => Some(b.to_vec()),
+                    _ => None,
+                })
+            },
+        )
+        .optional()?
+        .flatten();
+    let Some(cd) = bytes.and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else {
+        return Ok(None);
+    };
+    // An unbounded budget never reports Oversize, so only a Thread is kept.
+    Ok(match reconstruct(conn, &cd, origin, u64::MAX)? {
+        Assembled::Thread(thread) => Some(*thread),
+        _ => None,
     })
 }
 
@@ -1174,5 +1454,409 @@ mod tests {
         assert!(matches!(stopped, Ok(Err("stop"))));
         let stopped = visit_threads_conn(&conn, &origin(), None, bounds, &mut |_| Err("stop"));
         assert!(matches!(stopped, Ok(Err("stop"))));
+    }
+
+    // --- cheap scan --------------------------------------------------------
+
+    /// Raw-value insert helpers for scan fixtures: TEXT, BLOB, NULL, INTEGER.
+    fn put_text(conn: &Connection, key: &str, raw: &str) {
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            params![key, raw],
+        )
+        .unwrap();
+    }
+
+    fn put_blob(conn: &Connection, key: &str, raw: &str) {
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            params![key, raw.as_bytes()],
+        )
+        .unwrap();
+    }
+
+    fn put_sql(conn: &Connection, key: &str, value_sql: &str) {
+        conn.execute(
+            &format!("INSERT INTO cursorDiskKV (key, value) VALUES (?1, {value_sql})"),
+            params![key],
+        )
+        .unwrap();
+    }
+
+    /// Every shape the scan must agree with `reconstruct` on: inline, headers-only
+    /// (missing / NULL / invalid / INTEGER / scalar / BLOB bubble rows, duplicate
+    /// and malformed headers), non-integer and `-0` timestamps, empty threads,
+    /// bad composerIds, and NULL / INTEGER / non-JSON / non-object values.
+    fn scan_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT UNIQUE, value BLOB)",
+            [],
+        )
+        .unwrap();
+        let c = &conn;
+        put_text(
+            c,
+            "composerData:inline",
+            r#"{"composerId":"inline","createdAt":100,"lastUpdatedAt":200,"conversation":[{"bubbleId":"a","type":1,"text":"x"},{"bubbleId":"b"}]}"#,
+        );
+        // BLOB-stored, ties `inline` on createdAt (rowid order breaks the tie).
+        put_blob(
+            c,
+            "composerData:blob",
+            r#"{"composerId":"blob","createdAt":100,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:hdr",
+            r#"{"composerId":"hdr","createdAt":300,"lastUpdatedAt":250,"conversation":[],
+            "fullConversationHeadersOnly":[{"type":1},{"bubbleId":7},"str",{"bubbleId":"ok"},{"bubbleId":"ok"},
+            {"bubbleId":"ok"},{"bubbleId":"missing"},{"bubbleId":"null"},{"bubbleId":"bad"},
+            {"bubbleId":"int"},{"bubbleId":"scalar"},{"bubbleId":"blobok"}]}"#,
+        );
+        put_text(c, "bubbleId:hdr:ok", r#"{"text":"x"}"#);
+        put_sql(c, "bubbleId:hdr:null", "NULL");
+        put_text(c, "bubbleId:hdr:bad", "{bad");
+        put_sql(c, "bubbleId:hdr:int", "9");
+        put_text(c, "bubbleId:hdr:scalar", "5");
+        put_blob(c, "bubbleId:hdr:blobok", r#"{"t":1}"#);
+        // Another composer whose key sorts right after hdr's range.
+        put_text(c, "bubbleId:hdrX:missing", r#"{"text":"decoy"}"#);
+        put_text(
+            c,
+            "composerData:hdr-noconv",
+            r#"{"composerId":"hdr-noconv","createdAt":5,"conversation":{"x":1},"fullConversationHeadersOnly":[{"bubbleId":"b"}]}"#,
+        );
+        put_text(c, "bubbleId:hdr-noconv:b", r#"{"text":"y"}"#);
+        put_text(
+            c,
+            "composerData:both",
+            r#"{"composerId":"both","createdAt":6,"conversation":[{}],"fullConversationHeadersOnly":[{"bubbleId":"z"}]}"#,
+        );
+        put_text(
+            c,
+            "composerData:hdr-empty",
+            r#"{"composerId":"hdr-empty","createdAt":7,"conversation":[],"fullConversationHeadersOnly":[{"bubbleId":"nope"}]}"#,
+        );
+        put_text(
+            c,
+            "composerData:hdr-obj",
+            r#"{"composerId":"hdr-obj","createdAt":8,"fullConversationHeadersOnly":{"bubbleId":"b"}}"#,
+        );
+        put_text(
+            c,
+            "composerData:empty",
+            r#"{"composerId":"empty","createdAt":9,"conversation":[]}"#,
+        );
+        put_text(
+            c,
+            "composerData:ts-real",
+            r#"{"composerId":"ts-real","createdAt":1.5,"lastUpdatedAt":1e3,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:ts-str",
+            r#"{"composerId":"ts-str","createdAt":"123","lastUpdatedAt":true,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:ts-negzero",
+            r#"{"composerId":"ts-negzero","createdAt":42,"lastUpdatedAt":-0,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:ts-big",
+            r#"{"composerId":"ts-big","createdAt":9223372036854775808,"lastUpdatedAt":-9223372036854775808,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:ts-null",
+            r#"{"composerId":"ts-null","createdAt":null,"lastUpdatedAt":11,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:cafe",
+            r#"{"composerId":"café","createdAt":12,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:noid",
+            r#"{"createdAt":1,"conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:emptyid",
+            r#"{"composerId":"","conversation":[1]}"#,
+        );
+        put_text(
+            c,
+            "composerData:numid",
+            r#"{"composerId":5,"conversation":[1]}"#,
+        );
+        // The row key and the composerId disagree: the session id (and state
+        // key) comes from composerId, the load from the row key.
+        put_text(
+            c,
+            "composerData:old-key",
+            r#"{"composerId":"renamed","createdAt":13,"conversation":[1]}"#,
+        );
+        put_sql(c, "composerData:null", "NULL");
+        put_sql(c, "composerData:int", "5");
+        put_text(c, "composerData:badjson", "{nope");
+        put_text(c, "composerData:arr", "[1,2]");
+        put_text(c, "composerData:str", r#""s""#);
+        conn
+    }
+
+    fn scan_pairs(conn: &Connection, limit: Option<usize>) -> Vec<(String, String)> {
+        scan_conn(conn, limit)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.composer_id, t.fingerprint))
+            .collect()
+    }
+
+    fn full_pairs(conn: &Connection, limit: Option<usize>) -> Vec<(String, String)> {
+        read_threads_conn(conn, &origin(), limit)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.envelope.session_id, t.fingerprint))
+            .collect()
+    }
+
+    #[test]
+    fn scan_fingerprints_equal_reconstruct_fingerprints() {
+        let conn = scan_fixture();
+        let full = full_pairs(&conn, None);
+        // Same threads, same fingerprints, same (newest-first, rowid-tiebroken)
+        // order as the full reader, so state files stay valid across upgrade.
+        assert_eq!(scan_pairs(&conn, None), full);
+        // And `limit` keeps exactly the same newest-N threads at every N.
+        for n in 1..=full.len() + 1 {
+            assert_eq!(
+                scan_pairs(&conn, Some(n)),
+                full_pairs(&conn, Some(n)),
+                "limit {n}"
+            );
+        }
+        // Pin the interesting cases so a change to both readers is still caught.
+        let get = |id: &str| full.iter().find(|(c, _)| c == id).map(|(_, f)| f.as_str());
+        assert_eq!(get("hdr"), Some("250:5")); // ok x3 (dup + escaped) + scalar + blobok
+        assert_eq!(get("inline"), Some("200:2"));
+        assert_eq!(get("blob"), Some("100:1"));
+        assert_eq!(get("hdr-noconv"), Some("5:1"));
+        assert_eq!(get("both"), Some("6:1"));
+        assert_eq!(get("ts-real"), Some("0:1"));
+        assert_eq!(get("ts-str"), Some("0:1"));
+        assert_eq!(get("ts-negzero"), Some("42:1"));
+        assert_eq!(get("ts-big"), Some("-9223372036854775808:1"));
+        assert_eq!(get("ts-null"), Some("11:1"));
+        assert_eq!(get("café"), Some("12:1"));
+        for dropped in ["hdr-empty", "hdr-obj", "empty", "noid", "emptyid", "numid"] {
+            assert_eq!(get(dropped), None, "{dropped} must be dropped");
+        }
+        assert_eq!(get("renamed"), Some("13:1"));
+        assert_eq!(full.len(), 12);
+    }
+
+    /// The scan's SQL leans on specific behaviour of the bundled SQLite's JSON
+    /// functions; pin each assumption so an upgrade that changes one fails here
+    /// rather than silently re-sending (or skipping) threads.
+    #[test]
+    fn bundled_sqlite_json_functions_behave_as_the_scan_assumes() {
+        let conn = Connection::open_in_memory().unwrap();
+        let q = |sql: &str| -> rusqlite::types::Value {
+            conn.query_row(&format!("SELECT {sql}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        use rusqlite::types::Value as V;
+        // json_array_length: 0 on a non-array, NULL on a missing path.
+        assert_eq!(q(r#"json_array_length('{"a":{}}', '$.a')"#), V::Integer(0));
+        assert_eq!(q(r#"json_array_length('{"a":"s"}', '$.a')"#), V::Integer(0));
+        assert_eq!(q(r#"json_array_length('{}', '$.a')"#), V::Null);
+        // json_type distinguishes integers from reals / booleans / strings.
+        assert_eq!(
+            q(r#"json_type('{"a":1.0}', '$.a')"#),
+            V::Text("real".into())
+        );
+        assert_eq!(
+            q(r#"json_type('{"a":1e3}', '$.a')"#),
+            V::Text("real".into())
+        );
+        assert_eq!(
+            q(r#"json_type('{"a":true}', '$.a')"#),
+            V::Text("true".into())
+        );
+        assert_eq!(
+            q(r#"json_type('{"a":"1"}', '$.a')"#),
+            V::Text("text".into())
+        );
+        // An "integer" beyond i64 extracts as REAL (rejected by int_col, like
+        // serde's as_i64); i64::MIN still extracts as INTEGER (accepted by both).
+        assert_eq!(
+            q(r#"typeof(json_extract('{"a":9223372036854775808}', '$.a'))"#),
+            V::Text("real".into())
+        );
+        assert_eq!(
+            q(r#"json_extract('{"a":-9223372036854775808}', '$.a')"#),
+            V::Integer(i64::MIN)
+        );
+        // `-0` is an "integer" to SQLite, but `->` keeps its token text.
+        assert_eq!(
+            q(r#"json_type('{"a":-0}', '$.a')"#),
+            V::Text("integer".into())
+        );
+        assert_eq!(q(r#"'{"a": -0 }' -> '$.a'"#), V::Text("-0".into()));
+        // json_valid is strict RFC 8259 (no JSON5), accepts any top-level value.
+        assert_eq!(q("json_valid('{bad')"), V::Integer(0));
+        assert_eq!(q("json_valid('{a:1}')"), V::Integer(0));
+        assert_eq!(q("json_valid('[1,]')"), V::Integer(0));
+        assert_eq!(q("json_valid('')"), V::Integer(0));
+        assert_eq!(q("json_valid('5')"), V::Integer(1));
+        assert_eq!(q("json_valid(' {} ')"), V::Integer(1));
+        // A BLOB must be CAST to TEXT to be read as JSON text.
+        assert_eq!(q("json_valid(CAST(x'7b7d' AS TEXT))"), V::Integer(1));
+        // Arrays extract as JSON text (parsed in Rust for the header list).
+        assert_eq!(
+            q(r#"json_extract('{"a":[{"b":1}]}', '$.a')"#),
+            V::Text(r#"[{"b":1}]"#.into())
+        );
+        // Serde agrees on the scalar cases the scan mirrors.
+        assert_eq!(serde_json::from_str::<Value>("-0").unwrap().as_i64(), None);
+        assert_eq!(
+            serde_json::from_str::<Value>("5").unwrap().as_i64(),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn cursor_db_opens_scans_and_loads_one_thread() {
+        let cd = json!({
+            "composerId": "c1",
+            "createdAt": 10i64,
+            "conversation": [{"bubbleId": "b", "type": 1, "text": "hello"}]
+        });
+        let (_d, path) = make_db(&[("composerData:c1", cd)]);
+        let db = CursorDb::open(&path).unwrap();
+        let scanned = db.scan(None).unwrap();
+        assert_eq!(
+            scanned,
+            vec![ThreadFingerprint {
+                key: "composerData:c1".into(),
+                composer_id: "c1".into(),
+                fingerprint: "10:1".into()
+            }]
+        );
+        let thread = db.load("composerData:c1", &origin()).unwrap().unwrap();
+        assert_eq!(thread.fingerprint, "10:1");
+        assert_eq!(thread.envelope.session_id, "c1");
+        // A thread that is not in the DB loads as None.
+        assert!(db.load("composerData:gone", &origin()).unwrap().is_none());
+        // Opening a missing DB fails cleanly.
+        assert_eq!(
+            cursor_err_kind(
+                &CursorDb::open(std::path::Path::new("/nonexistent/x.vscdb"))
+                    .err()
+                    .unwrap()
+            ),
+            "open"
+        );
+    }
+
+    #[test]
+    fn load_skips_null_and_invalid_rows_and_reconstructs_headers() {
+        let conn = scan_fixture();
+        assert!(load_conn(&conn, "composerData:null", &origin())
+            .unwrap()
+            .is_none());
+        assert!(load_conn(&conn, "composerData:badjson", &origin())
+            .unwrap()
+            .is_none());
+        assert!(load_conn(&conn, "composerData:empty", &origin())
+            .unwrap()
+            .is_none());
+        let hdr = load_conn(&conn, "composerData:hdr", &origin())
+            .unwrap()
+            .unwrap();
+        assert_eq!(hdr.fingerprint, "250:5");
+        // Loaded by row key, identified by composerId.
+        let renamed = load_conn(&conn, "composerData:old-key", &origin())
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed.envelope.session_id, "renamed");
+        let scanned = scan_conn(&conn, None).unwrap();
+        let entry = scanned.iter().find(|t| t.composer_id == "renamed").unwrap();
+        assert_eq!(entry.key, "composerData:old-key");
+    }
+
+    #[test]
+    fn scan_errors_surface_as_query_errors() {
+        // No table: the scan's prepare fails.
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(
+            cursor_err_kind(&scan_conn(&conn, None).err().unwrap()),
+            "query"
+        );
+        assert_eq!(
+            cursor_err_kind(&load_conn(&conn, "composerData:x", &origin()).err().unwrap()),
+            "query"
+        );
+        // A headers-only thread whose bubble row key is invalid UTF-8: the
+        // bubble key scan fails to decode it and the error propagates.
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT UNIQUE, value BLOB)",
+            [],
+        )
+        .unwrap();
+        put_text(
+            &conn,
+            "composerData:CID",
+            r#"{"composerId":"CID","createdAt":1,"conversation":[],"fullConversationHeadersOnly":[{"bubbleId":"b"}]}"#,
+        );
+        let mut bad_key = b"bubbleId:CID:b".to_vec();
+        bad_key.push(0xff);
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (CAST(?1 AS TEXT), '{}')",
+            params![bad_key],
+        )
+        .unwrap();
+        assert_eq!(
+            cursor_err_kind(&scan_conn(&conn, None).err().unwrap()),
+            "query"
+        );
+    }
+
+    #[test]
+    fn scan_non_utf8_composer_key_surfaces_query_error() {
+        // Same as the full reader: the key decode fails, through the closure's
+        // `?` and the row-iteration `?`.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT UNIQUE, value BLOB)",
+            [],
+        )
+        .unwrap();
+        let mut key = b"composerData:bad".to_vec();
+        key.push(0xff);
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (CAST(?1 AS TEXT), '{}')",
+            params![key],
+        )
+        .unwrap();
+        assert_eq!(
+            cursor_err_kind(&scan_conn(&conn, None).err().unwrap()),
+            "query"
+        );
+    }
+
+    #[test]
+    fn valid_bubble_ids_missing_table_surfaces_query_error() {
+        // Unreachable via scan_conn (whose own prepare fails first), so the
+        // helper's prepare error edge is exercised directly.
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(
+            cursor_err_kind(&valid_bubble_ids(&conn, "CID").err().unwrap()),
+            "query"
+        );
     }
 }

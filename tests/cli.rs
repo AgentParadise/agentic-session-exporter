@@ -95,6 +95,52 @@ fn a_bare_positional_argument_is_rejected() {
     );
 }
 
+/// --dry-run counts what a sweep would discover (every transcript that
+/// parses) without uploading or writing state, and a source it cannot read is
+/// an error rather than a count of zero.
+#[test]
+fn dry_run_counts_parseable_transcripts_and_fails_on_an_unreadable_source() {
+    let tmp = std::env::temp_dir().join("apss-cli-dry-run-count");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("claude/p")).expect("fixture dirs");
+    std::fs::write(
+        tmp.join("claude/p/s.jsonl"),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+    )
+    .expect("fixture file");
+    std::fs::write(tmp.join("claude/p/empty.jsonl"), "").expect("fixture file");
+    let dry_run = |claude: std::path::PathBuf| {
+        bin()
+            .arg("--dry-run")
+            .env("SESSION_STORE_URL", "http://127.0.0.1:1")
+            .env("CLAUDE_PROJECTS_ROOT", claude)
+            .env("CODEX_SESSIONS_ROOT", tmp.join("codex"))
+            .env("EXPORTER_STATE_FILE", tmp.join("state.json"))
+            .env("HOME", &tmp)
+            .env_remove("CURSOR_STATE_DB")
+            .output()
+            .expect("binary should run")
+    };
+
+    let out = dry_run(tmp.join("claude"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("dry-run: discovered 1 transcript(s)"),
+        "got: {stdout}"
+    );
+    assert!(!tmp.join("state.json").exists(), "a dry run wrote state");
+
+    let out = dry_run(tmp.join("claude/p/s.jsonl"));
+    assert!(!out.status.success(), "a file as the Claude root must fail");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 #[ignore = "documents a real defect: --dry-run currently attempts the network. \
 Un-ignore when it is network-free. See docs/REQUIREMENTS.md section 2."]

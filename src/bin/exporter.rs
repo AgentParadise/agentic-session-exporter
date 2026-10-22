@@ -4,7 +4,8 @@
 //!   (default)          one capture sweep, then exit.
 //!   --loop SECONDS     run forever, sweeping every SECONDS (the daemon mode).
 //!   --health           report the age of the last successful sweep and exit.
-//!   --dry-run          discover + count only; no network, no state writes.
+//!   --dry-run          discover + count only, one transcript in memory at a
+//!                      time; no network, no state writes.
 //!   --ignore-state     do not read the state file; re-send everything found.
 //!   --cursor-limit N   cap the run to the newest N Cursor threads (alias
 //!                      --limit N). Mainly for a fast bounded test against a
@@ -26,7 +27,6 @@ use std::time::Duration;
 
 use agentic_session_exporter::{
     config::Config,
-    discover_all,
     health::{self, HealthStatus},
     run, RunSummary,
 };
@@ -242,10 +242,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Health => return run_health_check(&cfg),
         Command::DryRun => {
-            let found = discover_all(&cfg)?;
+            let found = count_transcripts(&cfg)?;
             println!(
                 "dry-run: discovered {} transcript(s) under claude={} codex={} cursor={}",
-                found.len(),
+                found,
                 cfg.claude_root.display(),
                 cfg.codex_root.display(),
                 cfg.cursor_db
@@ -624,6 +624,26 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
         json,
         ignore_state,
     })
+}
+
+/// Count the transcripts a sweep would discover, without holding them: each is
+/// read, parsed, counted and dropped before the next, so a dry run costs one
+/// transcript of memory rather than the corpus. The count is the one the
+/// collected discovery reported (every transcript that parses).
+fn count_transcripts(
+    cfg: &Config,
+) -> Result<usize, agentic_session_exporter::sources::SourceError> {
+    use agentic_session_exporter::sources::{Found, VisitError};
+    let mut found = 0usize;
+    agentic_session_exporter::visit_all(cfg, u64::MAX, &mut |item| {
+        found += usize::from(matches!(item, Found::Transcript(_)));
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .map_err(|error| match error {
+        VisitError::Source(error) => error,
+        VisitError::Visitor(never) => match never {},
+    })?;
+    Ok(found)
 }
 
 /// True when every session the sweep found reached the store.
