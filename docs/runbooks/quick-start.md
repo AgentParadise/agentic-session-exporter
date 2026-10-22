@@ -105,6 +105,35 @@ apss-session-exporter --loop
 Or drive it from cron, a systemd timer, or a launchd agent - the binary does not
 care, and a one-shot invocation is always safe to repeat.
 
+On macOS, a launchd agent that starts a one-shot sweep every few minutes is the
+better fit than `--loop`: the process exits between sweeps, so it returns all
+of its memory while idle, and a sweep that finds nothing changed takes well
+under a second. Save as `~/Library/LaunchAgents/apss-session-exporter.plist`,
+with the configuration from step 2 under `EnvironmentVariables`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>apss-session-exporter</string>
+  <key>ProgramArguments</key>
+  <array><string>/usr/local/bin/apss-session-exporter</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SESSION_STORE_URL</key><string>https://store.example</string>
+  </dict>
+</dict>
+</plist>
+```
+
+Then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/apss-session-exporter.plist`.
+On Linux, a systemd service running `--loop` (or a timer running one-shot
+sweeps) is fine.
+
 ## What "done" looks like
 
 - `--version` answers with no configuration
