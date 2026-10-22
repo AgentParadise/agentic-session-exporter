@@ -404,16 +404,22 @@ pub async fn run(cfg: &Config) -> Result<RunSummary, RunError> {
         batch_bytes: BATCH_BYTE_BUDGET,
         max_envelope_bytes: cfg.max_envelope_bytes,
     };
+    // Cursor candidates that load to nothing (rows only SQLite's JSON reader
+    // accepts, see `cursor::SCAN_SQL`) are not threads to the full reader, so
+    // they are left out of the count the gate records.
+    let cursor_unloaded = std::cell::Cell::new(0usize);
     let items = pending.into_iter().map(|candidate| {
         let is_cursor = matches!(candidate.kind, SourceKind::Cursor { .. });
-        Ok(
-            load_candidate(&candidate, &origin, cursor, &cfg.tags)?.map(|loaded| Item {
-                path: candidate.path,
-                fingerprint: loaded.fingerprint,
-                is_cursor,
-                envelope: loaded.envelope,
-            }),
-        )
+        let loaded = load_candidate(&candidate, &origin, cursor, &cfg.tags)?;
+        if loaded.is_none() && is_cursor {
+            cursor_unloaded.set(cursor_unloaded.get() + 1);
+        }
+        Ok(loaded.map(|loaded| Item {
+            path: candidate.path,
+            fingerprint: loaded.fingerprint,
+            is_cursor,
+            envelope: loaded.envelope,
+        }))
     });
     let outcome = upload_stream(&client, limits, items, &mut state, &mut summary).await?;
     // A changed candidate that no longer loads (vanished, empty, unparseable)
@@ -430,7 +436,8 @@ pub async fn run(cfg: &Config) -> Result<RunSummary, RunError> {
         gated.is_none() && outcome.cursor_unsettled == 0 && g.settled(scan_started)
     };
     if let Some((db, g)) = gate.filter(|(_, g)| close(g)) {
-        state.mark(db, format!("{}#{cursor_scanned}", g.signature));
+        let threads = cursor_scanned - cursor_unloaded.get();
+        state.mark(db, format!("{}#{threads}", g.signature));
         persist(&state);
     }
     if summary.failed == 0 {
@@ -2213,6 +2220,39 @@ mod tests {
         // (and here fails, the DB being garbage).
         set_mtime(&db, mtime - Duration::from_secs(5));
         assert!(run(&cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_gate_counts_only_threads_the_full_reader_would_find() {
+        // A composer row only SQLite's JSON reader accepts scans as a candidate
+        // but loads as nothing. It is not discovered on the miss, and a later
+        // hit must not report it either.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("state.vscdb");
+        settled_cursor_db(&db);
+        let mtime = std::fs::metadata(&db).unwrap().modified().unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO cursorDiskKV VALUES ('composerData:inf',
+                 '{"composerId":"inf","createdAt":2,"x":1e999,"conversation":[1]}');"#,
+        )
+        .unwrap();
+        drop(conn);
+        set_mtime(&db, mtime);
+        let url = spawn_server(vec![
+            http_response(200, b"ok"),
+            accepted(&[CLAUDE_ID, "c1"]),
+            http_response(200, b"ok"),
+        ]);
+        let cfg = Config {
+            cursor_db: Some(db),
+            ..test_config(&url, tmp.path())
+        };
+        let miss = run(&cfg).await.unwrap();
+        assert_eq!(miss.discovered, 2);
+        assert!(gate_entry(&cfg).unwrap().ends_with("#1"));
+        let hit = run(&cfg).await.unwrap();
+        assert_eq!((hit.discovered, hit.skipped_unchanged), (2, 2));
     }
 
     #[tokio::test]

@@ -288,26 +288,35 @@ fn scan_conn(
     let Some(limit) = limit else {
         return Ok(scanned.into_iter().map(|(_, _, t)| t).collect());
     };
-    // Under a limit, a row SQLite accepts but serde rejects (see SCAN_SQL) must
-    // not take a slot: the full reader skips it and fills the slot with the next
-    // thread, and a run would otherwise load nothing for that slot and never
-    // capture the thread that belongs there. Only the selected rows are probed,
-    // one composer value at a time.
+    // Under a limit, a row the full reader would not emit (SQLite accepts it but
+    // serde rejects the composer or its bubbles, see SCAN_SQL) must not take a
+    // slot: the full reader fills the slot with the next thread, and a run would
+    // otherwise load nothing for that slot and never capture the thread that
+    // belongs there. Only the selected rows are probed, one thread at a time.
     let mut kept = Vec::with_capacity(limit.min(scanned.len()));
     for (_, _, thread) in scanned {
         if kept.len() >= limit {
             break;
         }
-        if serde_accepts(conn, &thread.key)? {
+        if full_reader_emits(conn, &thread.key)? {
             kept.push(thread);
         }
     }
     Ok(kept)
 }
 
-/// Whether the full reader would read the composer row at `key` as a thread at
-/// all: its `createdAt` probe and its full JSON parse both succeed.
-fn serde_accepts(conn: &Connection, key: &str) -> Result<bool, CursorError> {
+/// Whether the full reader would emit the composer row at `key` as a thread:
+/// its `createdAt` probe accepts the row and the row reconstructs to a
+/// non-empty thread with serde's reading of the composer and bubble rows.
+fn full_reader_emits(conn: &Connection, key: &str) -> Result<bool, CursorError> {
+    if !created_probe_accepts(conn, key)? {
+        return Ok(false);
+    }
+    Ok(load_conn(conn, key, &Origin::new("probe", "local"))?.is_some())
+}
+
+/// The full reader's first-pass `createdAt` probe of the row at `key`.
+fn created_probe_accepts(conn: &Connection, key: &str) -> Result<bool, CursorError> {
     let accepted = conn
         .query_row(
             "SELECT value FROM cursorDiskKV WHERE key = ?1",
@@ -316,7 +325,6 @@ fn serde_accepts(conn: &Connection, key: &str) -> Result<bool, CursorError> {
                 Ok(match row.get_ref(0)? {
                     ValueRef::Text(b) | ValueRef::Blob(b) => {
                         serde_json::from_slice::<Created>(b).is_ok()
-                            && serde_json::from_slice::<Value>(b).is_ok()
                     }
                     _ => false,
                 })
@@ -1730,6 +1738,14 @@ mod tests {
             "composerData:dup-created",
             r#"{"composerId":"dup-created","createdAt":999,"createdAt":998,"conversation":[1]}"#,
         );
+        // Its only bubble is valid to SQLite (a lone surrogate escape) but not
+        // to serde, so the full reader finds it empty.
+        put_text(
+            c,
+            "composerData:lone",
+            r#"{"composerId":"lone","createdAt":1001,"conversation":[],"fullConversationHeadersOnly":[{"bubbleId":"s"}]}"#,
+        );
+        put_text(c, "bubbleId:lone:s", r#"{"text":"\ud800"}"#);
         // Outside the prefix in any case: never a thread.
         put_text(
             c,
@@ -1752,13 +1768,13 @@ mod tests {
             .filter(|pair| !full.contains(pair))
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(unlimited, vec!["huge-num", "dup-created"]);
+        assert_eq!(unlimited, vec!["lone", "huge-num", "dup-created"]);
         assert!(load_conn(&conn, "composerData:huge-num", &origin())
             .unwrap()
             .is_none());
         // A probe of a row that vanished, or is not text, accepts nothing.
-        assert!(!serde_accepts(&conn, "composerData:gone").unwrap());
-        assert!(!serde_accepts(&conn, "composerData:null").unwrap());
+        assert!(!created_probe_accepts(&conn, "composerData:gone").unwrap());
+        assert!(!created_probe_accepts(&conn, "composerData:null").unwrap());
     }
 
     /// The scan's SQL leans on specific behaviour of the bundled SQLite's JSON
