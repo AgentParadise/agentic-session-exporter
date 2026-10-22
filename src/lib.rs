@@ -508,8 +508,9 @@ struct Batch {
 ///   - otherwise added to the current batch, which is flushed first if the item
 ///     would overflow the byte budget (so an item larger than the budget goes
 ///     solo, never zero-sized), and flushed after when it reaches
-///     `batch_items`. These are the same batches the earlier plan-then-send
-///     form produced, since batches were always consecutive runs of items.
+///     `batch_items` or fills the budget. These are the same batches the
+///     earlier plan-then-send form produced, since batches were always
+///     consecutive runs of items and a full batch could take no further item.
 ///
 /// Each flush sends, marks what the store confirmed, persists state, and drops
 /// the batch. A load error (a Cursor query failure) aborts the stream;
@@ -553,7 +554,10 @@ where
             .items
             .push((item.path, item.fingerprint, item.is_cursor));
         batch.bytes += size;
-        if batch.envelopes.len() >= max_items {
+        // A batch at its item count or byte budget can take nothing more, so it
+        // is sent now rather than when the next item arrives: otherwise a large
+        // transcript would still be held while the next one is loaded.
+        if batch.envelopes.len() >= max_items || batch.bytes >= limits.batch_bytes {
             flush(sender, &mut batch, state, summary, &mut outcome).await;
         }
     }
@@ -898,6 +902,29 @@ mod tests {
             batches_for(&[("big", 1000), ("b", 1), ("c", 1)], limits(50, budget)).await,
             vec![1, 2]
         );
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_fills_the_budget_is_sent_before_the_next_item_loads() {
+        // Peak memory is one batch plus one loaded item, never a large item
+        // plus the next: each item records how many batches had been sent by
+        // the time it was loaded.
+        let sender = RecordingSender::default();
+        let mut state = temp_state();
+        let mut summary = RunSummary::default();
+        let budget = estimated_len(&envelope("big", 1000)) / 2;
+        let sent_when_loaded = std::sync::Mutex::new(Vec::new());
+        let items = loaded(&pending(&[("big", 1000), ("b", 1), ("c", 1)]), false)
+            .into_iter()
+            .inspect(|_| {
+                let sent = sender.batches.lock().unwrap().len();
+                sent_when_loaded.lock().unwrap().push(sent);
+            });
+        upload_stream(&sender, limits(50, budget), items, &mut state, &mut summary)
+            .await
+            .unwrap();
+        assert_eq!(sent_when_loaded.into_inner().unwrap(), vec![0, 1, 1]);
+        assert_eq!(sender.batches.into_inner().unwrap(), vec![1, 2]);
     }
 
     #[tokio::test]
