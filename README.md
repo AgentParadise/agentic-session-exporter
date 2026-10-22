@@ -158,6 +158,15 @@ apss-session-exporter --loop
 Or drive it from cron, a systemd timer, or a launchd agent. It holds no state
 between runs beyond its own state file, so a repeated invocation is always safe.
 
+A sweep reads only what changed since the last one: transcripts are
+fingerprinted from file metadata (and, for Cursor, inside SQLite) before any is
+read, and an unchanged Cursor database is not opened at all. A no-change sweep
+takes well under a second. On macOS, prefer a launchd agent that runs a
+one-shot sweep on `StartInterval` with `KeepAlive` false over a resident
+`--loop`: the process exits between sweeps, so it holds no memory while idle.
+See [the quick start](docs/runbooks/quick-start.md#6-keep-it-running) for the
+plist.
+
 ### Bring a session back
 
 ```bash

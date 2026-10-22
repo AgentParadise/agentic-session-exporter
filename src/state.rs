@@ -89,6 +89,14 @@ impl State {
             .unwrap_or(false)
     }
 
+    /// The value recorded for `path`, if any. Used for the whole-DB Cursor gate
+    /// entry, whose value carries more than a plain fingerprint.
+    pub fn get(&self, path: &Path) -> Option<&str> {
+        self.seen
+            .get(&path.to_string_lossy().to_string())
+            .map(String::as_str)
+    }
+
     /// Record a fingerprint for a path (after a successful upload).
     pub fn mark(&mut self, path: &Path, fingerprint: String) {
         self.seen
@@ -123,6 +131,15 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_returns_the_recorded_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::load(&tmp.path().join("s.json"), "");
+        state.mark(Path::new("/db"), "sig#3".into());
+        assert_eq!(state.get(Path::new("/db")), Some("sig#3"));
+        assert_eq!(state.get(Path::new("/other")), None);
+    }
 
     #[test]
     fn round_trips_and_detects_change() {

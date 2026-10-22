@@ -33,6 +33,14 @@ impl Outcome {
     }
 }
 
+/// Request body for `POST /v1/sessions/batch`. Borrows the envelopes so the body
+/// is serialized straight from them; `json!` would first deep-copy every
+/// verbatim envelope into a `Value` tree, doubling a batch's memory.
+#[derive(serde::Serialize)]
+struct BatchBody<'a> {
+    envelopes: &'a [SessionEnvelope],
+}
+
 #[derive(Debug, Deserialize)]
 struct IngestResponse {
     results: Vec<Outcome>,
@@ -90,7 +98,7 @@ impl BatchSender for Client {
         let mut req = self
             .http
             .post(&self.endpoint)
-            .json(&serde_json::json!({ "envelopes": batch }));
+            .json(&BatchBody { envelopes: batch });
         if let Some(tok) = &self.write_token {
             req = req.bearer_auth(tok);
         }
