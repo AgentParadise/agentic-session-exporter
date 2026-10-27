@@ -128,3 +128,51 @@ tombstone metadata remain; this does not purge workspace source transcripts.
 APSS content hash. It requires no configuration, writes no state, and performs no
 network request. Origin retention uses it to persist deletion identity before
 removing local bytes, without duplicating canonical hashing in another language.
+
+## Revision confirmation (DRAFT)
+
+`--capture-confirm` asks the store whether it holds one exact qualified revision,
+so a caller can decide whether its own local copy may go. It implements the
+unratified APS-V1-0004 draft in
+[APSS PR #154](https://github.com/AgentParadise/agent-paradise-standards-system/pull/154)
+(base 5.1.1 capabilities, base 5.3.1 confirmation, inventory profile
+`HEAD /v1/transcripts`). Every wire detail (paths, query names, the stored-hash
+header and the capability keys) lives in `src/revision_confirm.rs`, so a ruling
+on the draft changes that module and not this CLI contract.
+
+**Configuration.** `SESSION_STORE_URL` and `CAPTURE_READ_TOKEN`, a read-scoped
+token (never the write token). No local state, no outbox, no spool directory.
+
+**Input.** At most 16 KiB of JSON on stdin, unknown fields rejected:
+`{"identity":{"source_instance_id":"...","harness":"...","native_session_id":"..."},"content_hash":"sha256:<64 lowercase hex>"}`.
+`content_hash` is the original-content hash the caller UPLOADED and persisted.
+The exporter never recomputes it.
+
+**Requests.** `GET /v1/capabilities`, then, only when it advertises
+`"revision_confirm": true` with a boolean `confirm_verifies_body`,
+`HEAD /v1/transcripts?source_instance_id&harness&native_session_id&content_hash`.
+Both carry `Authorization: Bearer`. Redirects are never followed. Each request
+times out after 10 seconds.
+
+**Output.** Exactly one JSON document on stdout:
+`{"schema_version":1,"outcome":"...","status":<u16|null>,"stored_content_hash":<string|null>,"body_verified":<bool|null>}`.
+
+| Store answer | `outcome` |
+|---|---|
+| capabilities 404, or `revision_confirm` absent or `false` | `not_advertised` (no HEAD sent) |
+| capabilities malformed, or `revision_confirm: true` without a boolean `confirm_verifies_body` | `unexpected` |
+| HEAD 200 with a valid `X-Stored-Content-Hash` | `confirmed` (`stored_content_hash`, `body_verified` set) |
+| HEAD 200 without one | `unexpected` |
+| 404 | `absent` (includes a superseded revision) |
+| 401, 403 | `unauthorized` |
+| 409 | `integrity_failure` |
+| 503, timeout, connection failure | `unavailable` (`status` null for transport failure) |
+| anything else, including any 3xx | `unexpected` |
+
+No outcome is ever reported as another. A `confirmed` revision is durably
+committed; it is NOT backup evidence (draft section 9), and the store may later
+supersede it, so confirm immediately before acting.
+
+**Exit codes.** `0`: the document carries the outcome, whatever it is. `1`:
+configuration or input error, no document on stdout. `2`: usage error,
+including `--json` or a second mode. The token never reaches stdout or stderr.

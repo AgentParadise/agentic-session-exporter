@@ -21,6 +21,11 @@ pub enum CaptureUploadError {
     Receipt,
 }
 
+/// Whether `hash` is an APSS original-content hash (`sha256:` + 64 lowercase hex).
+pub fn is_content_hash(hash: &str) -> bool {
+    valid_content_hash(hash)
+}
+
 pub(crate) fn valid_content_hash(hash: &str) -> bool {
     hash.strip_prefix("sha256:").is_some_and(|hex| {
         hex.len() == 64

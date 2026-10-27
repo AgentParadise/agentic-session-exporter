@@ -26,6 +26,7 @@ pub mod inventory_outbox;
 pub mod parsers;
 pub mod qualified_capture;
 pub mod reconstitute;
+pub mod revision_confirm;
 pub mod secure_fs;
 pub mod sources;
 pub mod spool;
