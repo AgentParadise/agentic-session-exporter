@@ -664,3 +664,141 @@ fn capture_delivery_cli_restarts_without_losing_pending_envelopes() {
         assert_eq!(bin().args(args).output().unwrap().status.code(), Some(2));
     }
 }
+
+/// `--capture-confirm` CLI contract (docs/qualified-capture.md, "Revision
+/// confirmation"): exit 0 with exactly one outcome document for any store
+/// answer, exit 1 with no document for configuration or input errors, exit 2
+/// for usage errors. The read token never reaches stdout or stderr.
+mod capture_confirm {
+    use super::bin;
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    const TOKEN: &str = "read-secret-c0nfirm";
+
+    fn store(replies: Vec<(u16, &'static str, &'static str)>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (status, headers, body) in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        url
+    }
+
+    fn confirm(url: &str, token: Option<&str>, input: &str) -> std::process::Output {
+        let mut command = bin();
+        command
+            .arg("--capture-confirm")
+            .env("SESSION_STORE_URL", url)
+            .env_remove("CAPTURE_READ_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(token) = token {
+            command.env("CAPTURE_READ_TOKEN", token);
+        }
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn request() -> String {
+        serde_json::json!({
+            "identity": {"source_instance_id":"install-1","harness":"claude","native_session_id":"n1"},
+            "content_hash": format!("sha256:{}", "a".repeat(64)),
+        })
+        .to_string()
+    }
+
+    fn assert_no_token(out: &std::process::Output) {
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!all.contains(TOKEN), "read token leaked: {all}");
+    }
+
+    #[test]
+    fn every_store_answer_exits_zero_with_one_outcome_document() {
+        let advertised = (
+            200,
+            "",
+            r#"{"revision_confirm":true,"confirm_verifies_body":true}"#,
+        );
+        let stored = "X-Stored-Content-Hash: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\n";
+        for (replies, outcome) in [
+            (vec![advertised, (200, stored, "")], "confirmed"),
+            (vec![advertised, (404, "", "")], "absent"),
+            (vec![advertised, (503, "", "")], "unavailable"),
+            (vec![advertised, (409, "", "")], "integrity_failure"),
+            (vec![(404, "", "")], "not_advertised"),
+        ] {
+            let out = confirm(&store(replies), Some(TOKEN), &request());
+            assert_eq!(out.status.code(), Some(0), "{outcome}");
+            let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(document["schema_version"], 1);
+            assert_eq!(document["outcome"], outcome);
+            assert_no_token(&out);
+        }
+    }
+
+    #[test]
+    fn an_unreachable_store_is_an_outcome_not_an_error_exit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let out = confirm(&url, Some(TOKEN), &request());
+        assert_eq!(out.status.code(), Some(0));
+        let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(document["outcome"], "unavailable");
+        assert_eq!(document["status"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn configuration_and_input_errors_exit_one_without_a_document() {
+        let url = "http://127.0.0.1:9";
+        let bad_hash = request().replace("sha256:aaaa", "sha256:AAAA");
+        let extra_field = request().replace("\"content_hash\"", "\"extra\":1,\"content_hash\"");
+        for (token, input) in [
+            (None, request()),
+            (Some("has space"), request()),
+            (Some(TOKEN), "{}".to_string()),
+            (Some(TOKEN), bad_hash),
+            (Some(TOKEN), extra_field),
+            (Some(TOKEN), "x".repeat(16385)),
+        ] {
+            let out = confirm(url, token, &input);
+            assert_eq!(out.status.code(), Some(1));
+            assert!(out.stdout.is_empty(), "no outcome document on error");
+            assert_no_token(&out);
+        }
+    }
+
+    #[test]
+    fn usage_errors_exit_two() {
+        for args in [
+            vec!["--capture-confirm", "--json"],
+            vec!["--capture-confirm", "--capture-receipt"],
+        ] {
+            let out = bin().args(args).output().unwrap();
+            assert_eq!(out.status.code(), Some(2));
+        }
+    }
+}

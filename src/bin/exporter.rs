@@ -47,6 +47,7 @@ enum Command {
     CaptureDelete,
     EnvelopeHash,
     CaptureReceipt,
+    CaptureConfirm,
     CaptureDrain(usize),
     SpoolList(u64, Option<u64>),
     SpoolRead(u64),
@@ -156,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Command::EnvelopeHash => return run_envelope_hash(),
+        Command::CaptureConfirm => return run_capture_confirm().await,
         Command::InventoryEnqueue | Command::InventoryDrain(_) => {
             return run_inventory(invocation.command).await;
         }
@@ -230,6 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Version
         | Command::Help
         | Command::EnvelopeHash
+        | Command::CaptureConfirm
         | Command::SpoolList(_, _)
         | Command::SpoolRead(_)
         | Command::InventoryEnqueue
@@ -409,6 +412,11 @@ Inventory replication (always emits JSON):
   --envelope-hash     validate and hash an envelope on stdin without configuration or storage.
   --capture-delete    durably queue exact qualified revision deletion from stdin (at most 16 KiB).
   --capture-receipt   look up a committed receipt for the qualified envelope on stdin.
+  --capture-confirm   ask the store whether it holds one exact qualified revision (stdin,
+                      at most 16 KiB); needs SESSION_STORE_URL and a read-scoped
+                      CAPTURE_READ_TOKEN, no local state. Exit 0 with one outcome
+                      document; 1 for configuration or input errors (no document).
+                      DRAFT APS-V1-0004 revision confirmation (APSS PR #154).
   --capture-drain N   retry at most N qualified captures (1..50); exit 3 if any remain
                       or any are quarantined.
   --inventory-enqueue accept one operation JSON from stdin (at most 2 MiB).
@@ -461,9 +469,11 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
                 i += 1;
             }
             "--envelope-hash" | "--capture-enqueue" | "--capture-receipt" | "--capture-delete"
-            | "--capture-drain" => {
+            | "--capture-confirm" | "--capture-drain" => {
                 let (selected, consumed) = if arg == "--capture-enqueue" {
                     (Command::CaptureEnqueue, 1)
+                } else if arg == "--capture-confirm" {
+                    (Command::CaptureConfirm, 1)
                 } else if arg == "--envelope-hash" {
                     (Command::EnvelopeHash, 1)
                 } else if arg == "--capture-delete" {
@@ -599,6 +609,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, ArgError> {
                 | Command::CaptureEnqueue
                 | Command::CaptureReceipt
                 | Command::CaptureDelete
+                | Command::CaptureConfirm
                 | Command::CaptureDrain(_)
         )
     {
@@ -833,6 +844,47 @@ fn run_envelope_hash() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         serde_json::json!({"schema_version":1,"content_hash":hash})
     );
+    Ok(())
+}
+
+/// `--capture-confirm`: one stateless revision confirmation (see
+/// docs/qualified-capture.md, "Revision confirmation"). Exit 0 means the
+/// stdout document carries the outcome, whatever it is; every store answer and
+/// transport failure is an outcome, never an error exit.
+async fn run_capture_confirm() -> Result<(), Box<dyn std::error::Error>> {
+    use agentic_session_exporter::{
+        capture_outbox::CaptureOutboxError, qualified_capture::CaptureUploadError,
+        revision_confirm::RevisionConfirmClient,
+    };
+    use std::io::Read;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        identity: session_capture::inventory::QualifiedTranscript,
+        content_hash: String,
+    }
+    let required = |name| {
+        std::env::var(name)
+            .map_err(|_| agentic_session_exporter::config::ConfigError::Missing(name))
+    };
+    let client = RevisionConfirmClient::new(
+        &required("SESSION_STORE_URL")?,
+        required("CAPTURE_READ_TOKEN")?,
+    )?;
+    let mut bytes = Vec::new();
+    std::io::stdin().take(16385).read_to_end(&mut bytes)?;
+    if bytes.len() > 16384 {
+        return Err(CaptureOutboxError::Invalid.into());
+    }
+    let request: Request =
+        serde_json::from_slice(&bytes).map_err(|_| CaptureOutboxError::Invalid)?;
+    if !agentic_session_exporter::qualified_capture::is_content_hash(&request.content_hash) {
+        return Err(CaptureUploadError::Invalid.into());
+    }
+    let confirmation = client
+        .confirm(&request.identity, &request.content_hash)
+        .await;
+    println!("{}", serde_json::to_string(&confirmation)?);
     Ok(())
 }
 
